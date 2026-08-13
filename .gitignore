@@ -1,0 +1,19 @@
+node_modules/
+dist/
+dist-electron/
+.vite/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.data/
+artifacts/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+.env
+.env.*
+!.env.example
+新建 文本文档.txt

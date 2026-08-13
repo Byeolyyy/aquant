@@ -1,0 +1,20 @@
+{
+  "name": "quant-agent",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm --workspace @quant-agent/desktop run dev",
+    "start": "npm --workspace @quant-agent/desktop run start",
+    "build": "npm --workspace @quant-agent/desktop run build",
+    "test": "npm --workspace @quant-agent/desktop run test",
+    "test:python": "cross-env PYTHONPATH=services/harness/src python -m unittest discover -s services/harness/tests -v",
+    "setup:electron": "install-electron"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

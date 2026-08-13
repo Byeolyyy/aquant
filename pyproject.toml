@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-agent-harness"
+version = "0.1.0"
+description = "Local-first multi-agent harness for PTrade research reports"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+dev = ["coverage>=7.6,<8"]
+agent = [
+  "httpx>=0.27,<1",
+  "langgraph>=1.0,<2",
+  "langgraph-checkpoint-sqlite>=2,<4",
+]
+
+[tool.setuptools]
+package-dir = {"" = "services/harness/src"}
+
+[tool.setuptools.packages.find]
+where = ["services/harness/src"]
+
