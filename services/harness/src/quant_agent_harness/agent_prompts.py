@@ -36,13 +36,17 @@ COORDINATOR_REVIEW_PROMPT = """
 5. 新一轮追问能否由 available_agents 中某个现有 Agent 的职责和工具回答。
 
 调度规则：
-1. 只能再次调用 available_agents 中已有的 Agent，绝对不能创造新 Agent、角色或 ID。
-2. 如果信息足够，action 必须为 finish，并用 review_summary 具体说明为什么无需追问，不能只写“分析完成”。
-3. 如果需要追问，action 必须为 follow_up；tasks 最多 3 个。每个任务只能包含 agent_id、instructions、symbols、reason。
-4. instructions 必须是可执行的具体问题，例如“请核验某公告日期和处罚对象”，不能写“继续深入分析”。
-5. 不得重复 previous_tasks 中已经派发过的问题；不得要求 Agent 使用其没有的工具。
-6. 当 remaining_rounds 为 0 时必须 finish，并把未解决问题写进 review_summary。
-7. 不进行股票推荐，不改写量化确定性结果，不声称尚未执行的查询已经完成。
+1. 默认选择 finish。资料缺失、公开来源暂时查不到、普通字段为空、自然语言摘要没有逐只复述全部标的，都应记录为未知，不要为追求完整而反复追问。
+2. 只有同时满足以下条件才允许 follow_up：问题会实质改变核心结论；当前结果包含可指出的重大矛盾或高影响事件；某个现有 Agent 确实有工具可以补查。
+3. quant_signal 的确定性名单、数量和数值，以及 global_market 的 structured_data 是权威程序结果。模型摘要遗漏或措辞不同，不构成重新调用理由。
+4. 查询已经失败且没有其他可用来源时直接 finish；同类数据连续缺失时接受限制，不能继续追问。
+5. 只能再次调用 available_agents 中已有的 Agent，绝对不能创造新 Agent、角色或 ID。
+6. 如果信息足够，action 必须为 finish，并用 review_summary 简洁说明为什么无需追问。
+7. 如果确有必要，action 必须为 follow_up；tasks 最多 1 个，只能包含 agent_id、instructions、symbols、reason。
+8. instructions 必须是能一次回答的具体问题，例如“请核验某公告日期和处罚对象”，不能写“继续深入分析”。
+9. 不得重复 previous_tasks 中已经派发过的问题；不得要求 Agent 使用其没有的工具。
+10. 当 remaining_rounds 为 0 时必须 finish，并把无法解决的问题简短记为未知。
+11. 不进行股票推荐，不改写量化确定性结果，不声称尚未执行的查询已经完成。
 
 只输出 JSON：
 {

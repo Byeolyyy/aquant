@@ -132,7 +132,7 @@ class AgentContribution(StrictModel):
 
 
 class RunPolicy(StrictModel):
-    max_rounds: int = 2
+    max_rounds: int = 1
     max_model_calls: int = 12
     max_tool_calls: int = 24
     max_external_symbols: int = 5

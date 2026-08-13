@@ -108,7 +108,7 @@ class LLMOrchestrationTests(unittest.TestCase):
             )
             self.assertIn("追加安排", coordinator_text)
             self.assertIn("核验 600000.SS", coordinator_text)
-            self.assertGreaterEqual(model.review_calls, 2)
+            self.assertEqual(model.review_calls, 1)
             self.assertFalse(
                 any(
                     task.get("agent_id") not in {"quant_signal", "company_industry", "global_market", "risk"}

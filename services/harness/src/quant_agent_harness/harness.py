@@ -322,19 +322,36 @@ class Harness:
             )
 
             remaining_rounds = max(0, policy.max_rounds - follow_up_rounds)
-            contributions, reviewed_again, _post_rounds, _dispatched = self._coordinator_follow_up_loop(
-                run_id,
-                report,
-                contributions,
-                review,
-                control,
-                available_agents=[*selected_agents, "risk"],
-                max_follow_up_rounds=remaining_rounds,
-                phase="post_risk_review",
-                previous_tasks=dispatched_follow_ups,
-            )
-            if reviewed_again is not None:
-                review = reviewed_again
+            if remaining_rounds > 0 and review.risks:
+                contributions, reviewed_again, _post_rounds, _dispatched = self._coordinator_follow_up_loop(
+                    run_id,
+                    report,
+                    contributions,
+                    review,
+                    control,
+                    available_agents=[*selected_agents, "risk"],
+                    max_follow_up_rounds=remaining_rounds,
+                    phase="post_risk_review",
+                    previous_tasks=dispatched_follow_ups,
+                )
+                if reviewed_again is not None:
+                    review = reviewed_again
+            else:
+                reason = (
+                    "本轮风险检索没有发现需要升级核验的明确利空，直接进入综合。"
+                    if not review.risks
+                    else "本轮自主补查额度已使用，剩余问题作为未知项进入最终综合。"
+                )
+                self._emit(
+                    run_id,
+                    "agent.message",
+                    agent_id="coordinator",
+                    payload={
+                        "content": "统筹复核：" + reason,
+                        "stage": "post_risk_review",
+                        "decision": "finish",
+                    },
+                )
 
             self.repository.update_run(run_id, "synthesizing")
             self._emit(run_id, "run.status", payload={"status": "synthesizing"})
@@ -497,6 +514,19 @@ class Harness:
                     },
                 )
             rounds_used += 1
+            if rounds_used >= max_follow_up_rounds:
+                self._emit(
+                    run_id,
+                    "agent.message",
+                    agent_id="coordinator",
+                    payload={
+                        "content": "统筹复核：本轮唯一一次补查已完成；不再重复追问，未取得的数据按未知项进入综合。",
+                        "stage": phase,
+                        "decision": "finish",
+                        "remaining_rounds": 0,
+                    },
+                )
+                break
         return contributions, review, rounds_used, dispatched
 
     def _coordinator_review_decision(
@@ -531,7 +561,10 @@ class Harness:
             ],
             "remaining_rounds": remaining_rounds,
             "previous_tasks": sorted(previous_tasks),
-            "agent_results": [_compact_contribution_for_review(item) for item in contributions],
+            "agent_results": [
+                _compact_contribution_for_review(item)
+                for item in _latest_contributions_by_agent(contributions)
+            ],
             "risk_result": _compact_contribution_for_review(review) if review else None,
         }
         try:
@@ -541,7 +574,7 @@ class Harness:
             valid_symbols = {row.symbol for row in report.stocks}
             tasks = []
             if action == "follow_up" and remaining_rounds > 0:
-                for raw in list(result.data.get("tasks") or [])[:3]:
+                for raw in list(result.data.get("tasks") or [])[:1]:
                     if not isinstance(raw, dict):
                         continue
                     agent_id = str(raw.get("agent_id") or "")
@@ -939,13 +972,23 @@ class Harness:
         lines: list[str] = []
         industries: list[str] = []
         snapshots: dict[str, dict] = {}
+        company_stocks = (report.selected_rows or report.stocks)[:3]
         if self.tushare_client is not None:
-            for stock in report.stocks[:5]:
-                snapshots[stock.symbol] = self.tushare_client.company_snapshot(stock.symbol)
+            with ThreadPoolExecutor(max_workers=max(1, min(3, len(company_stocks)))) as executor:
+                pending = {
+                    executor.submit(self.tushare_client.company_snapshot, stock.symbol): stock.symbol
+                    for stock in company_stocks
+                }
+                for future in as_completed(pending):
+                    symbol = pending[future]
+                    try:
+                        snapshots[symbol] = future.result()
+                    except Exception as exc:
+                        unknowns.append(f"{symbol} Tushare 查询失败：" + _external_error(exc))
         else:
             unknowns.append("Tushare 未配置，公司财务和估值字段无法查询")
 
-        preferred_symbols = [row.symbol for row in report.selected_rows] or [row.symbol for row in report.stocks]
+        preferred_symbols = [row.symbol for row in company_stocks]
         public_bundles = (
             self.public_a_stock_client.research(preferred_symbols, max_stocks=3)
             if self.public_a_stock_client is not None
@@ -953,7 +996,7 @@ class Harness:
         )
         public_by_symbol = {str(item.get("symbol")): item for item in public_bundles}
 
-        for stock in report.stocks[:5]:
+        for stock in company_stocks:
             result = _company_stock_details(
                 stock,
                 snapshots.get(stock.symbol) or {},
@@ -982,7 +1025,7 @@ class Harness:
                 )
                 industry_evidence = _tavily_evidence(
                     response,
-                    symbols=[stock.symbol for stock in report.stocks[:5]],
+                    symbols=[stock.symbol for stock in company_stocks],
                 )
                 evidence.extend(industry_evidence)
                 if industry_evidence:
@@ -1477,23 +1520,32 @@ def _compact_contribution_for_review(contribution: AgentContribution | None) -> 
         return None
     return {
         "agent_id": contribution.agent_id,
-        "summary": contribution.summary[:5000],
-        "claims": [claim.model_dump(mode="json") for claim in contribution.claims[:30]],
-        "risks": contribution.risks[:30],
-        "unknowns": contribution.unknowns[:30],
-        "follow_up_requests": contribution.follow_up_requests[:20],
+        "summary": contribution.summary[:1800],
+        "claims": [claim.model_dump(mode="json") for claim in contribution.claims[:12]],
+        "risks": contribution.risks[:10],
+        "unknowns": contribution.unknowns[:10],
+        "follow_up_requests": contribution.follow_up_requests[:8],
         "evidence": [
             {
                 "evidence_id": item.evidence_id,
                 "source_type": item.source_type,
                 "title": item.title,
-                "excerpt": item.excerpt[:500],
+                "excerpt": item.excerpt[:220],
                 "published_at": item.published_at,
                 "symbols": item.symbols,
             }
-            for item in contribution.evidence[:40]
+            for item in contribution.evidence[:12]
         ],
     }
+
+
+def _latest_contributions_by_agent(
+    contributions: list[AgentContribution],
+) -> list[AgentContribution]:
+    latest: dict[str, AgentContribution] = {}
+    for contribution in contributions:
+        latest[contribution.agent_id] = contribution
+    return list(latest.values())
 
 
 def _follow_up_signature(agent_id: str, instructions: str, symbols: list[str]) -> str:
