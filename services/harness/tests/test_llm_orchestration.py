@@ -82,6 +82,14 @@ class LLMOrchestrationTests(unittest.TestCase):
             snapshot = repository.run_snapshot(run_id)
             self.assertEqual(snapshot["final"]["title"], "模型综合")
             self.assertEqual(snapshot["final"]["model"], "fake-coordinator")
+            silent_pass_stages = {
+                event.payload.get("stage")
+                for event in events
+                if event.kind == "agent.message" and event.agent_id == "coordinator"
+            }
+            self.assertNotIn("specialist_review", silent_pass_stages)
+            self.assertNotIn("post_risk_review", silent_pass_stages)
+            self.assertNotIn("synthesis_handoff", silent_pass_stages)
 
     def test_coordinator_reuses_existing_agent_and_deduplicates_follow_up(self):
         with tempfile.TemporaryDirectory() as temp_dir:

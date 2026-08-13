@@ -121,7 +121,7 @@ class HarnessTests(unittest.TestCase):
                 if event.kind == "agent.message" and event.agent_id == "coordinator"
             ]
             self.assertIn("risk_review_handoff", coordinator_stages)
-            self.assertIn("synthesis_handoff", coordinator_stages)
+            self.assertNotIn("synthesis_handoff", coordinator_stages)
             self.assertEqual(events[-1].kind, "run.completed")
 
     def test_history_agent_is_never_dispatched(self):

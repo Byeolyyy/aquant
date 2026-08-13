@@ -337,34 +337,31 @@ class Harness:
                 if reviewed_again is not None:
                     review = reviewed_again
             else:
-                reason = (
-                    "本轮风险检索没有发现需要升级核验的明确利空，直接进入综合。"
-                    if not review.risks
-                    else "本轮自主补查额度已使用，剩余问题作为未知项进入最终综合。"
-                )
+                if review.risks:
+                    self._emit(
+                        run_id,
+                        "agent.message",
+                        agent_id="coordinator",
+                        payload={
+                            "content": "统筹复核：本轮自主补查额度已使用，剩余风险问题作为未知项进入最终综合。",
+                            "stage": "post_risk_review",
+                            "decision": "finish",
+                        },
+                    )
+
+            self.repository.update_run(run_id, "synthesizing")
+            self._emit(run_id, "run.status", payload={"status": "synthesizing"})
+            if review.risks:
                 self._emit(
                     run_id,
                     "agent.message",
                     agent_id="coordinator",
                     payload={
-                        "content": "统筹复核：" + reason,
-                        "stage": "post_risk_review",
-                        "decision": "finish",
+                        "content": "风险 Agent 发现了需要纳入结论的利空线索，我将结合来源和其他分析进行最终综合。",
+                        "stage": "synthesis_handoff",
+                        "reviewed_by": "risk",
                     },
                 )
-
-            self.repository.update_run(run_id, "synthesizing")
-            self._emit(run_id, "run.status", payload={"status": "synthesizing"})
-            self._emit(
-                run_id,
-                "agent.message",
-                agent_id="coordinator",
-                payload={
-                    "content": "逐票利空检索已返回。我将合并专业分析与这些有来源的风险消息，形成最终研究综合。",
-                    "stage": "synthesis_handoff",
-                    "reviewed_by": "risk",
-                },
-            )
             final = self._synthesize(run_id, report, contributions, review, steering)
             self._emit(run_id, "agent.message", agent_id="coordinator", payload=final)
             self.repository.update_run(run_id, "completed", final)
@@ -412,17 +409,6 @@ class Harness:
             action = str(decision.get("action") or "finish")
             summary = str(decision.get("review_summary") or "统筹已完成本轮审阅。")
             if action != "follow_up" or not tasks or remaining <= 0:
-                self._emit(
-                    run_id,
-                    "agent.message",
-                    agent_id="coordinator",
-                    payload={
-                        "content": "统筹审阅：" + summary,
-                        "stage": phase,
-                        "decision": "finish",
-                        "remaining_rounds": remaining,
-                    },
-                )
                 break
 
             assignment_text = "；".join(
@@ -515,17 +501,6 @@ class Harness:
                 )
             rounds_used += 1
             if rounds_used >= max_follow_up_rounds:
-                self._emit(
-                    run_id,
-                    "agent.message",
-                    agent_id="coordinator",
-                    payload={
-                        "content": "统筹复核：本轮唯一一次补查已完成；不再重复追问，未取得的数据按未知项进入综合。",
-                        "stage": phase,
-                        "decision": "finish",
-                        "remaining_rounds": 0,
-                    },
-                )
                 break
         return contributions, review, rounds_used, dispatched
 
