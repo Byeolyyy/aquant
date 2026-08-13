@@ -39,6 +39,31 @@ class FakeModel:
         raise RuntimeError("专业 Agent 故意回退到确定性输出")
 
 
+class ReplanningModel(FakeModel):
+    def __init__(self):
+        self.review_calls = 0
+
+    def complete_json(self, system: str, user: str) -> ModelResult:
+        if "现在不是做最终总结" in system:
+            self.review_calls += 1
+            return ModelResult(
+                data={
+                    "action": "follow_up",
+                    "review_summary": "公司资料提到重要监管信息，但缺少进一步核验。",
+                    "tasks": [
+                        {
+                            "agent_id": "company_industry",
+                            "instructions": "请核验 600000.SS 是否存在正式监管公告，并说明公告日期和对象。",
+                            "symbols": ["600000.SS"],
+                            "reason": "重要监管信息需要正式来源支持",
+                        }
+                    ],
+                },
+                model=self.model,
+            )
+        return super().complete_json(system, user)
+
+
 class LLMOrchestrationTests(unittest.TestCase):
     def test_model_coordinator_cannot_drop_required_agents_and_synthesizes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -57,6 +82,41 @@ class LLMOrchestrationTests(unittest.TestCase):
             snapshot = repository.run_snapshot(run_id)
             self.assertEqual(snapshot["final"]["title"], "模型综合")
             self.assertEqual(snapshot["final"]["model"], "fake-coordinator")
+
+    def test_coordinator_reuses_existing_agent_and_deduplicates_follow_up(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = Repository(Path(temp_dir) / "test.sqlite")
+            report = parse_ptrade_report(RAW)
+            repository.save_report(report)
+            events = []
+            model = ReplanningModel()
+            harness = Harness(repository, events.append, model)  # type: ignore[arg-type]
+            run_id = harness.start(report.report_id)
+            harness.wait(run_id, timeout=5)
+
+            company_messages = [
+                event
+                for event in events
+                if event.kind == "agent.message" and event.agent_id == "company_industry"
+            ]
+            self.assertEqual(len(company_messages), 2)
+            self.assertTrue(any(event.kind == "task.replan" for event in events))
+            coordinator_text = "\n".join(
+                str(event.payload.get("content") or "")
+                for event in events
+                if event.kind == "agent.message" and event.agent_id == "coordinator"
+            )
+            self.assertIn("追加安排", coordinator_text)
+            self.assertIn("核验 600000.SS", coordinator_text)
+            self.assertGreaterEqual(model.review_calls, 2)
+            self.assertFalse(
+                any(
+                    task.get("agent_id") not in {"quant_signal", "company_industry", "global_market", "risk"}
+                    for event in events
+                    if event.kind == "task.replan"
+                    for task in event.payload.get("tasks") or []
+                )
+            )
 
 
 if __name__ == "__main__":

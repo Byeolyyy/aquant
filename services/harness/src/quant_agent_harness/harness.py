@@ -21,6 +21,7 @@ from .agent_prompts import (
     AGENT_PROMPT_IDS,
     AGENT_PROMPTS,
     COORDINATOR_PLANNING_PROMPT,
+    COORDINATOR_REVIEW_PROMPT,
     RISK_PROMPT,
     PLATFORM_POLICY_PROMPT,
     SYNTHESIS_PROMPT,
@@ -267,6 +268,19 @@ class Harness:
                     payload={"content": "已在节点边界接收你的补充指令。", "steering": steering},
                 )
 
+            contributions, _unused_review, follow_up_rounds, dispatched_follow_ups = (
+                self._coordinator_follow_up_loop(
+                    run_id,
+                    report,
+                    contributions,
+                    None,
+                    control,
+                    available_agents=selected_agents,
+                    max_follow_up_rounds=max(0, policy.max_rounds),
+                    phase="specialist_review",
+                )
+            )
+
             self.repository.update_run(run_id, "risk_review")
             self._emit(run_id, "run.status", payload={"status": "risk_review"})
             self._emit(
@@ -307,6 +321,21 @@ class Harness:
                 payload=review.model_dump(mode="json"),
             )
 
+            remaining_rounds = max(0, policy.max_rounds - follow_up_rounds)
+            contributions, reviewed_again, _post_rounds, _dispatched = self._coordinator_follow_up_loop(
+                run_id,
+                report,
+                contributions,
+                review,
+                control,
+                available_agents=[*selected_agents, "risk"],
+                max_follow_up_rounds=remaining_rounds,
+                phase="post_risk_review",
+                previous_tasks=dispatched_follow_ups,
+            )
+            if reviewed_again is not None:
+                review = reviewed_again
+
             self.repository.update_run(run_id, "synthesizing")
             self._emit(run_id, "run.status", payload={"status": "synthesizing"})
             self._emit(
@@ -327,6 +356,244 @@ class Harness:
             self.repository.update_run(run_id, "failed", {"error": str(exc)})
             self._emit(run_id, "run.error", payload={"error": f"{type(exc).__name__}: {exc}"})
 
+    def _coordinator_follow_up_loop(
+        self,
+        run_id: str,
+        report: ParsedReport,
+        contributions: list[AgentContribution],
+        review: AgentContribution | None,
+        control: RunControl,
+        *,
+        available_agents: list[str],
+        max_follow_up_rounds: int,
+        phase: str,
+        previous_tasks: set[str] | None = None,
+    ) -> tuple[list[AgentContribution], AgentContribution | None, int, set[str]]:
+        """Let the coordinator review results and re-call only existing agents."""
+
+        enabled = self.repository.enabled_agent_ids()
+        allowed = [
+            agent_id
+            for agent_id in dict.fromkeys(available_agents)
+            if agent_id in enabled and agent_id in {"quant_signal", "company_industry", "global_market", "risk"}
+        ]
+        dispatched = set(previous_tasks or set())
+        rounds_used = 0
+        while True:
+            remaining = max(0, max_follow_up_rounds - rounds_used)
+            decision = self._coordinator_review_decision(
+                run_id,
+                report,
+                contributions,
+                review,
+                available_agents=allowed,
+                remaining_rounds=remaining,
+                previous_tasks=dispatched,
+                phase=phase,
+            )
+            tasks = list(decision.get("tasks") or [])
+            action = str(decision.get("action") or "finish")
+            summary = str(decision.get("review_summary") or "统筹已完成本轮审阅。")
+            if action != "follow_up" or not tasks or remaining <= 0:
+                self._emit(
+                    run_id,
+                    "agent.message",
+                    agent_id="coordinator",
+                    payload={
+                        "content": "统筹审阅：" + summary,
+                        "stage": phase,
+                        "decision": "finish",
+                        "remaining_rounds": remaining,
+                    },
+                )
+                break
+
+            assignment_text = "；".join(
+                f"{_agent_display_name(str(item['agent_id']))}：{item['instructions']}"
+                for item in tasks
+            )
+            self._emit(
+                run_id,
+                "agent.message",
+                agent_id="coordinator",
+                payload={
+                    "content": f"统筹审阅：{summary}\n追加安排：{assignment_text}",
+                    "stage": phase,
+                    "decision": "follow_up",
+                    "tasks": tasks,
+                    "round": rounds_used + 1,
+                },
+            )
+
+            configs = {item["agent_id"]: item for item in self.repository.list_agent_configs()}
+            follow_up_tasks: list[AgentTask] = []
+            for item in tasks:
+                agent_id = str(item["agent_id"])
+                definition = workflow_definition(agent_id)
+                follow_up_tasks.append(
+                    AgentTask(
+                        run_id=run_id,
+                        agent_id=agent_id,
+                        title="统筹追问 · " + self._task_title(agent_id),
+                        instructions="统筹追问：" + str(item["instructions"]),
+                        symbols=list(item.get("symbols") or []),
+                        config_version=int((configs.get(agent_id) or {}).get("config_version") or 1),
+                        prompt_version=self._prompt(
+                            AGENT_PROMPT_IDS[agent_id],
+                            RISK_PROMPT if agent_id == "risk" else AGENT_PROMPTS[agent_id],
+                        )[1],
+                        workflow_id=str(definition["workflow_id"]),
+                        workflow_version=int(definition["version"]),
+                    )
+                )
+            self._emit(
+                run_id,
+                "task.replan",
+                agent_id="coordinator",
+                payload={
+                    "phase": phase,
+                    "round": rounds_used + 1,
+                    "tasks": [task.model_dump(mode="json") for task in follow_up_tasks],
+                },
+            )
+
+            for task in follow_up_tasks:
+                control.wait_if_paused()
+                if control.cancelled.is_set():
+                    return contributions, review, rounds_used, dispatched
+                if task.agent_id == "risk":
+                    started = time.perf_counter()
+                    self._emit(
+                        run_id,
+                        "agent.lifecycle",
+                        agent_id="risk",
+                        payload={"status": "started", "stage": "coordinator_follow_up"},
+                    )
+                    self._emit_workflow_plan(task)
+                    result = self._review(run_id, report, contributions, task)
+                    review = result
+                    self._emit(
+                        run_id,
+                        "agent.lifecycle",
+                        agent_id="risk",
+                        payload={
+                            "status": "completed",
+                            "stage": "coordinator_follow_up",
+                            "duration_ms": int((time.perf_counter() - started) * 1000),
+                            "risk_count": len(result.risks),
+                        },
+                    )
+                else:
+                    result = self._execute_task(task, report, control)
+                    contributions.append(result)
+                self._emit(
+                    run_id,
+                    "agent.message",
+                    agent_id=result.agent_id,
+                    payload={
+                        **result.model_dump(mode="json"),
+                        "stage": "coordinator_follow_up_result",
+                        "requested_by": "coordinator",
+                    },
+                )
+            rounds_used += 1
+        return contributions, review, rounds_used, dispatched
+
+    def _coordinator_review_decision(
+        self,
+        run_id: str,
+        report: ParsedReport,
+        contributions: list[AgentContribution],
+        review: AgentContribution | None,
+        *,
+        available_agents: list[str],
+        remaining_rounds: int,
+        previous_tasks: set[str],
+        phase: str,
+    ) -> dict:
+        if self.llm_client is None:
+            return {
+                "action": "finish",
+                "review_summary": "当前未配置可用模型，统筹无法进行自主追问判断，已按现有结果继续。",
+                "tasks": [],
+            }
+        system = self._prompt("coordinator.review", COORDINATOR_REVIEW_PROMPT)[0]
+        payload = {
+            "phase": phase,
+            "report": {
+                "report_date": report.report_date,
+                "parse_status": report.parse_status,
+                "symbols": [row.symbol for row in report.stocks],
+            },
+            "available_agents": [
+                {"agent_id": agent_id, "responsibility": _agent_responsibility(agent_id)}
+                for agent_id in available_agents
+            ],
+            "remaining_rounds": remaining_rounds,
+            "previous_tasks": sorted(previous_tasks),
+            "agent_results": [_compact_contribution_for_review(item) for item in contributions],
+            "risk_result": _compact_contribution_for_review(review) if review else None,
+        }
+        try:
+            result = self.llm_client.complete_json(system, json.dumps(payload, ensure_ascii=False, default=str))
+            action = str(result.data.get("action") or "finish").lower()
+            review_summary = str(result.data.get("review_summary") or "").strip()[:1200]
+            valid_symbols = {row.symbol for row in report.stocks}
+            tasks = []
+            if action == "follow_up" and remaining_rounds > 0:
+                for raw in list(result.data.get("tasks") or [])[:3]:
+                    if not isinstance(raw, dict):
+                        continue
+                    agent_id = str(raw.get("agent_id") or "")
+                    instructions = str(raw.get("instructions") or "").strip()[:1000]
+                    symbols = [str(item) for item in raw.get("symbols") or [] if str(item) in valid_symbols]
+                    reason = str(raw.get("reason") or "").strip()[:500]
+                    if agent_id not in available_agents or len(instructions) < 8:
+                        continue
+                    signature = _follow_up_signature(agent_id, instructions, symbols)
+                    if signature in previous_tasks:
+                        continue
+                    previous_tasks.add(signature)
+                    tasks.append(
+                        {
+                            "agent_id": agent_id,
+                            "instructions": instructions,
+                            "symbols": symbols,
+                            "reason": reason or "统筹审阅认为该问题会影响最终结论",
+                        }
+                    )
+            if not tasks:
+                action = "finish"
+            self._emit(
+                run_id,
+                "model.usage",
+                agent_id="coordinator",
+                payload={
+                    "stage": "review",
+                    "phase": phase,
+                    "model": result.model,
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                },
+            )
+            return {
+                "action": action,
+                "review_summary": review_summary or "统筹已检查现有结果，未发现必须追加的有效任务。",
+                "tasks": tasks,
+            }
+        except Exception as exc:
+            self._emit(
+                run_id,
+                "model.fallback",
+                agent_id="coordinator",
+                payload={"stage": "review", "phase": phase, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            return {
+                "action": "finish",
+                "review_summary": "统筹审阅模型本轮不可用，已保留现有结果并停止追加调用。",
+                "tasks": [],
+            }
+
     def _execute_task(self, task: AgentTask, report: ParsedReport, control: RunControl) -> AgentContribution:
         control.wait_if_paused()
         if control.cancelled.is_set():
@@ -342,7 +609,11 @@ class Harness:
             if task.agent_id == "quant_signal":
                 contribution = self._run_quant_workflow(task, report)
             elif task.agent_id == "company_industry":
-                contribution = self._llm_contribution(task, report, self._company_contribution(report))
+                contribution = self._llm_contribution(
+                    task,
+                    report,
+                    self._company_contribution(report, task.instructions, task.symbols),
+                )
             elif task.agent_id == "global_market":
                 contribution = self._run_global_market_workflow(task, report)
             else:
@@ -656,7 +927,12 @@ class Harness:
             risks=risks,
         )
 
-    def _company_contribution(self, report: ParsedReport) -> AgentContribution:
+    def _company_contribution(
+        self,
+        report: ParsedReport,
+        focus: str = "",
+        focus_symbols: list[str] | None = None,
+    ) -> AgentContribution:
         evidence: list[EvidenceItem] = []
         claims: list[Claim] = []
         unknowns: list[str] = []
@@ -715,6 +991,31 @@ class Harness:
                     )
             except Exception as exc:
                 unknowns.append("行业补充检索失败：" + _external_error(exc))
+        if focus.startswith("统筹追问：") and self.tavily_client is not None:
+            scoped = [
+                symbol
+                for symbol in (focus_symbols or preferred_symbols)
+                if symbol in {row.symbol for row in report.stocks}
+            ][:3]
+            for symbol in scoped:
+                try:
+                    response = self.tavily_client.search(
+                        f"A股 {symbol} {focus.removeprefix('统筹追问：')[:500]}",
+                        max_results=6,
+                        time_range="year",
+                    )
+                    follow_up_evidence = _tavily_evidence(
+                        response,
+                        symbols=[symbol],
+                        assign_unmatched=True,
+                    )
+                    evidence.extend(follow_up_evidence)
+                    lines.append(
+                        f"统筹追问补查：{symbol} 围绕“{focus.removeprefix('统筹追问：')[:160]}”"
+                        f"取得 {len(follow_up_evidence)} 条联网资料。"
+                    )
+                except Exception as exc:
+                    unknowns.append(f"{symbol} 统筹追问补查失败：" + _external_error(exc))
         return AgentContribution(
             agent_id="company_industry",
             summary="\n\n".join(lines) if lines else "本轮没有取得可核验的公司与行业资料。",
@@ -801,7 +1102,7 @@ class Harness:
         search_result = self._workflow_step(
             task,
             "negative_news_search",
-            lambda: self._search_negative_news(report, scope),
+            lambda: self._search_negative_news(report, scope, task.instructions),
         )
         flagged = self._workflow_step(
             task,
@@ -822,7 +1123,12 @@ class Harness:
             lambda: self._llm_review(run_id, report, contributions, fallback),
         )
 
-    def _search_negative_news(self, report: ParsedReport, scope: list[dict]) -> dict:
+    def _search_negative_news(
+        self,
+        report: ParsedReport,
+        scope: list[dict],
+        focus: str = "",
+    ) -> dict:
         evidence: list[EvidenceItem] = []
         unknowns: list[str] = []
         symbols = [str(item["symbol"]) for item in scope]
@@ -845,6 +1151,8 @@ class Harness:
                     f"A股 {name} {code} 利空 负面 公告 减持 立案 调查 处罚 问询 诉讼 "
                     f"预亏 下修 质押 冻结 解禁 违约 退市 风险 截至 {report.report_date or '今天'}"
                 )
+                if focus.startswith("统筹追问："):
+                    query += " " + focus.removeprefix("统筹追问：")[:500]
                 try:
                     response = self.tavily_client.search(query, max_results=6, time_range="year")
                     found = _tavily_evidence(response, symbols=[symbol], assign_unmatched=True)
@@ -931,14 +1239,18 @@ class Harness:
         review: AgentContribution,
         steering: list[str],
     ) -> dict[str, object]:
-        signal = next((item for item in contributions if item.agent_id == "quant_signal"), None)
+        signal = next(
+            (item for item in reversed(contributions) if item.agent_id == "quant_signal"),
+            None,
+        )
         completed_labels = {
             "quant_signal": "量化",
             "company_industry": "公司行业",
             "global_market": "外围市场",
         }
         completed_text = "、".join(
-            completed_labels.get(item.agent_id, item.agent_id) for item in contributions
+            completed_labels.get(agent_id, agent_id)
+            for agent_id in dict.fromkeys(item.agent_id for item in contributions)
         )
         evidence_count = sum(len(item.evidence) for item in contributions)
         external_count = sum(
@@ -1115,6 +1427,7 @@ class Harness:
             "quant_signal": "检查量化信号与数据质量",
             "company_industry": "核验公司与行业背景",
             "global_market": "汇总美股与韩国核心指数走势",
+            "risk": "逐票检索近期负面公告与新闻",
         }.get(agent_id, "执行专业分析")
 
     def _prompt(self, prompt_id: str, fallback: str) -> tuple[str, str]:
@@ -1139,6 +1452,53 @@ class Harness:
             )
             self.repository.append_event(event)
         self.event_sink(event)
+
+
+def _agent_display_name(agent_id: str) -> str:
+    return {
+        "quant_signal": "量化信号 Agent",
+        "company_industry": "公司与行业 Agent",
+        "global_market": "外围市场 Agent",
+        "risk": "风险 Agent",
+    }.get(agent_id, agent_id)
+
+
+def _agent_responsibility(agent_id: str) -> str:
+    return {
+        "quant_signal": "复核 PTrade 量化字段、正式观察和候选规则，只解释确定性数据",
+        "company_industry": "查询公司身份、财务、公告、新闻和行业资料，可按统筹问题补查",
+        "global_market": "核对报告日对应的美股与韩国指数日期、点位和涨跌",
+        "risk": "逐票检索报告日前的负面公告和新闻，并总结有来源的潜在利空",
+    }.get(agent_id, "执行现有职责范围内的补充分析")
+
+
+def _compact_contribution_for_review(contribution: AgentContribution | None) -> dict | None:
+    if contribution is None:
+        return None
+    return {
+        "agent_id": contribution.agent_id,
+        "summary": contribution.summary[:5000],
+        "claims": [claim.model_dump(mode="json") for claim in contribution.claims[:30]],
+        "risks": contribution.risks[:30],
+        "unknowns": contribution.unknowns[:30],
+        "follow_up_requests": contribution.follow_up_requests[:20],
+        "evidence": [
+            {
+                "evidence_id": item.evidence_id,
+                "source_type": item.source_type,
+                "title": item.title,
+                "excerpt": item.excerpt[:500],
+                "published_at": item.published_at,
+                "symbols": item.symbols,
+            }
+            for item in contribution.evidence[:40]
+        ],
+    }
+
+
+def _follow_up_signature(agent_id: str, instructions: str, symbols: list[str]) -> str:
+    normalized = re.sub(r"\s+", " ", instructions).strip().lower()
+    return f"{agent_id}|{','.join(sorted(symbols))}|{normalized}"
 
 
 def _compact_report(report: ParsedReport) -> dict[str, object]:

@@ -25,6 +25,41 @@ COORDINATOR_PLANNING_PROMPT = """
 """.strip()
 
 
+COORDINATOR_REVIEW_PROMPT = """
+你是 A 股多 Agent 研究室的统筹 Agent。现在不是做最终总结，而是审阅现有子 Agent 刚刚返回的结果，并决定是否要追问现有 Agent。
+
+你必须认真完成以下检查：
+1. 不同 Agent 对股票、日期、数值或事件的描述是否矛盾。
+2. 重要结论是否缺少来源、只有单一弱来源，或者被 Agent 写得比证据更确定。
+3. 是否出现值得继续查清的重大信息，例如监管立案、处罚、诉讼、预亏、业绩下修、债务问题或异常行情。
+4. Agent 的 unknowns、follow_up_requests 或查询失败是否会实质影响最终结论。
+5. 新一轮追问能否由 available_agents 中某个现有 Agent 的职责和工具回答。
+
+调度规则：
+1. 只能再次调用 available_agents 中已有的 Agent，绝对不能创造新 Agent、角色或 ID。
+2. 如果信息足够，action 必须为 finish，并用 review_summary 具体说明为什么无需追问，不能只写“分析完成”。
+3. 如果需要追问，action 必须为 follow_up；tasks 最多 3 个。每个任务只能包含 agent_id、instructions、symbols、reason。
+4. instructions 必须是可执行的具体问题，例如“请核验某公告日期和处罚对象”，不能写“继续深入分析”。
+5. 不得重复 previous_tasks 中已经派发过的问题；不得要求 Agent 使用其没有的工具。
+6. 当 remaining_rounds 为 0 时必须 finish，并把未解决问题写进 review_summary。
+7. 不进行股票推荐，不改写量化确定性结果，不声称尚未执行的查询已经完成。
+
+只输出 JSON：
+{
+  "action": "finish" 或 "follow_up",
+  "review_summary": "面向用户的具体审阅结论",
+  "tasks": [
+    {
+      "agent_id": "现有 Agent ID",
+      "instructions": "具体追问内容",
+      "symbols": ["相关股票代码"],
+      "reason": "为什么必须补查"
+    }
+  ]
+}
+""".strip()
+
+
 QUANT_SIGNAL_PROMPT = """
 你是量化信号 Agent。Harness 给出的 deterministic_fallback 是经过程序计算的权威结果，你只负责把它讲清楚。
 
@@ -128,6 +163,15 @@ PROMPT_DEFINITIONS = [
         "layer": "system",
         "locked": False,
         "content": SYNTHESIS_PROMPT,
+    },
+    {
+        "prompt_id": "coordinator.review",
+        "agent_id": "coordinator",
+        "name": "统筹审阅与追问 Prompt",
+        "description": "审阅子 Agent 结果，并决定是否再次调用现有 Agent 补查。",
+        "layer": "system",
+        "locked": False,
+        "content": COORDINATOR_REVIEW_PROMPT,
     },
     {
         "prompt_id": "quant_signal.system",
