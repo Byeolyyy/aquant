@@ -16,8 +16,9 @@ export function eventSummary(event: HarnessEvent): string {
   if (typeof payload.summary === "string") return payload.summary;
   if (typeof payload.executive_summary === "string") {
     const sections = [payload.executive_summary];
-    appendSection(sections, "信号解读", payload.signal_interpretation);
-    appendSection(sections, "风险提示", payload.risk_notes);
+    appendSection(sections, "量化依据", payload.signal_interpretation);
+    appendSection(sections, "消息面", payload.news_summary);
+    appendSection(sections, "风险", payload.risk_notes);
     appendSection(sections, "证据缺口", payload.evidence_gaps);
     if (typeof payload.disclaimer === "string") sections.push(payload.disclaimer);
     return sections.join("\n\n");

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from quant_agent_harness.harness import Harness
+from quant_agent_harness.models import AgentContribution, EvidenceItem
 from quant_agent_harness.parser import parse_ptrade_report
 from quant_agent_harness.repository import Repository
 
@@ -96,6 +97,49 @@ class FakeGlobalMarket:
 
 
 class HarnessTests(unittest.TestCase):
+    def test_final_summary_is_rule_driven_and_stock_specific(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = Repository(Path(temp_dir) / "test.sqlite")
+            repository.upsert_security_master_rows(
+                [{"code": "600000", "name": "浦发银行", "industry": "银行Ⅱ"}],
+                "2026-08-14T16:00:00+08:00",
+            )
+            report = parse_ptrade_report(RAW)
+            harness = Harness(repository)
+            harness._hydrate_report_security_names(report)
+            quant = harness._quant_contribution(report)
+            company = AgentContribution(
+                agent_id="company_industry",
+                summary="600000.SS｜浦发银行｜银行Ⅱ。",
+                evidence=[
+                    EvidenceItem(
+                        source_type="official_web",
+                        title="浦发银行半年度业绩公告",
+                        published_at="2026-08-10",
+                        symbols=["600000.SS"],
+                    )
+                ],
+            )
+            review = AgentContribution(
+                agent_id="risk",
+                summary=(
+                    "逐票利空检索：\n\n"
+                    "600000.SS｜浦发银行\n"
+                    "- 2026-08-09｜业绩风险｜净利润增速仍需结合资产质量核验\n"
+                ),
+            )
+
+            final = harness._synthesize("run", report, [quant, company], review, [])
+
+            self.assertEqual(final["title"], "统筹规则推荐")
+            self.assertEqual(len(final["recommendations"]), 1)
+            self.assertIn("600000.SS｜浦发银行", final["executive_summary"])
+            self.assertIn("资金公式", final["signal_interpretation"][0])
+            self.assertIn("浦发银行半年度业绩公告", final["news_summary"][0])
+            self.assertIn("资产质量核验", final["risk_notes"][0])
+            self.assertNotIn("本轮已完成", final["executive_summary"])
+            self.assertNotIn("共登记", final["executive_summary"])
+
     def test_dynamic_team_and_completed_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = Repository(Path(temp_dir) / "test.sqlite")
