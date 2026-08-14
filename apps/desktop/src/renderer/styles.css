@@ -406,6 +406,13 @@ pre { max-height: 280px; overflow: auto; padding: 11px; border: 1px solid #c6beb
 .prompt-edit-meta { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; }
 .prompt-edit-meta > span:first-child { color: var(--ink); font: 900 10px ui-monospace, monospace; }
 .prompt-edit-meta small { margin-left: auto; color: #827970; font-size: 8px; }
+.strategy-template-guide { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; margin-bottom: 10px; padding: 11px 12px; border: 1px solid #7d9072; border-radius: 6px; background: #eef3dc; }
+.strategy-template-guide > div:first-child { display: flex; flex-direction: column; gap: 3px; }
+.strategy-template-guide b { color: var(--ink); font-size: 11px; }
+.strategy-template-guide > div:first-child span { color: #5f6759; font-size: 9px; line-height: 1.45; }
+.strategy-template-guide > button { align-self: start; padding: 7px 9px; font-size: 8px; }
+.strategy-section-chips { display: flex; grid-column: 1 / -1; flex-wrap: wrap; gap: 5px; }
+.strategy-section-chips span { padding: 4px 6px; border: 1px solid #a5af94; border-radius: 999px; color: #4f5b45; background: #fafcf1; font-size: 8px; font-weight: 700; }
 .version-status { padding: 3px 5px; border-radius: 3px; color: #665f56; background: #e2dacf; font-size: 8px; font-weight: 800; }
 .version-status.version-published { color: #fff; background: var(--green); }
 .version-status.version-draft { color: var(--ink); background: var(--lime); }

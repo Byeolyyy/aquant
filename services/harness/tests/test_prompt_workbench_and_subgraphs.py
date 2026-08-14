@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from quant_agent_harness.agent_prompts import PLATFORM_POLICY_PROMPT
-from quant_agent_harness.harness import Harness
+from quant_agent_harness.harness import Harness, _compact_report
 from quant_agent_harness.global_markets import GlobalMarketClient
 from quant_agent_harness.local_knowledge import LocalKnowledgeIndex
 from quant_agent_harness.models import EvidenceItem
@@ -63,6 +64,75 @@ class PromptWorkbenchAndSubgraphTests(unittest.TestCase):
             rolled_back, rolled_back_version = repository.published_prompt("global_market.system", "")
             self.assertEqual(rolled_back, original)
             self.assertEqual(rolled_back_version, 3)
+
+    def test_quant_prompt_is_exposed_as_editable_strategy_template(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = Repository(Path(temp_dir) / "test.sqlite")
+            workspace = repository.prompt_workspace()
+            quant = next(item for item in workspace if item["prompt_id"] == "quant_signal.system")
+            published = next(item for item in quant["versions"] if item["status"] == "published")
+
+            self.assertEqual(quant["name"], "量化策略模板")
+            self.assertEqual(
+                quant["template_sections"],
+                [
+                    "策略基本信息",
+                    "输入字段字典",
+                    "核心条件",
+                    "信号分层规则",
+                    "单只标的解释顺序",
+                    "缺失值与冲突处理",
+                ],
+            )
+            self.assertIn("【策略配置区：用户可修改】", published["content"])
+            self.assertIn("P1 候选", quant["starter_content"])
+
+    def test_untouched_legacy_quant_prompt_is_migrated_without_overwriting_user_versions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "test.sqlite"
+            Repository(db_path)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute("DELETE FROM prompt_versions WHERE prompt_id='quant_signal.system'")
+                connection.execute(
+                    """
+                    INSERT INTO prompt_versions
+                        (version_id, prompt_id, version_number, content, status, change_note, published_at)
+                    VALUES ('legacy-quant-v1', 'quant_signal.system', 1,
+                            '旧版量化提示词，仅解释固定字段和候选结果。',
+                            'published', '系统初始版本', CURRENT_TIMESTAMP)
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            repository = Repository(db_path)
+            quant = next(
+                item for item in repository.prompt_workspace()
+                if item["prompt_id"] == "quant_signal.system"
+            )
+            published = next(item for item in quant["versions"] if item["status"] == "published")
+            legacy = next(item for item in quant["versions"] if item["version_id"] == "legacy-quant-v1")
+
+            self.assertEqual(published["version_number"], 2)
+            self.assertIn("【策略配置区：用户可修改】", published["content"])
+            self.assertEqual(legacy["status"], "archived")
+
+    def test_quant_strategy_inputs_keep_custom_report_fields(self):
+        report = parse_ptrade_report(
+            RAW.replace(
+                "l4_buy_sell\n",
+                "l4_buy_sell custom_momentum_score\n",
+            ).replace(
+                "2.5 True\n",
+                "2.5 True 87.5\n",
+            )
+        )
+        compact = _compact_report(report, include_unknown=True)
+        stocks = compact["stocks"]
+
+        self.assertEqual(stocks[0]["unknown_fields"]["custom_momentum_score"], "87.5")
 
     def test_platform_policy_is_locked_and_always_bound(self):
         with tempfile.TemporaryDirectory() as temp_dir:

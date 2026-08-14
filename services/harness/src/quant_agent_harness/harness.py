@@ -1395,16 +1395,16 @@ class Harness:
         )
         prompt_id = AGENT_PROMPT_IDS.get(task.agent_id, f"{task.agent_id}.system")
         system = self._prompt(prompt_id, fallback_prompt)[0]
-        user = json.dumps(
-            {
-                "task": task.model_dump(mode="json"),
-                "report": _compact_report(report),
-                "deterministic_fallback": fallback.model_dump(mode="json", exclude={"evidence"}),
-                "minimum_evidence": [item.model_dump(mode="json") for item in fallback.evidence],
-            },
-            ensure_ascii=False,
-            default=str,
-        )
+        compact_report = _compact_report(report, include_unknown=task.agent_id == "quant_signal")
+        model_input = {
+            "task": task.model_dump(mode="json"),
+            "report": compact_report,
+            "deterministic_fallback": fallback.model_dump(mode="json", exclude={"evidence"}),
+            "minimum_evidence": [item.model_dump(mode="json") for item in fallback.evidence],
+        }
+        if task.agent_id == "quant_signal":
+            model_input["strategy_inputs"] = compact_report.pop("stocks", [])
+        user = json.dumps(model_input, ensure_ascii=False, default=str)
         try:
             result = self.llm_client.complete_json(system, user)
             candidate = AgentContribution.model_validate(result.data)
@@ -1528,14 +1528,15 @@ def _follow_up_signature(agent_id: str, instructions: str, symbols: list[str]) -
     return f"{agent_id}|{','.join(sorted(symbols))}|{normalized}"
 
 
-def _compact_report(report: ParsedReport) -> dict[str, object]:
+def _compact_report(report: ParsedReport, *, include_unknown: bool = False) -> dict[str, object]:
+    excluded_fields = {"raw_row"} if include_unknown else {"raw_row", "unknown_fields"}
     return {
         "report_id": report.report_id,
         "generated_at": report.generated_at,
         "run_slot": report.run_slot,
         "parse_status": report.parse_status,
         "diagnostics": report.diagnostics,
-        "stocks": [row.model_dump(mode="json", exclude={"raw_row", "unknown_fields"}) for row in report.stocks],
+        "stocks": [row.model_dump(mode="json", exclude=excluded_fields) for row in report.stocks],
     }
 
 

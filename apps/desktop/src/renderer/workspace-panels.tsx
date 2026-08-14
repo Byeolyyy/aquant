@@ -64,6 +64,8 @@ export interface PromptTemplate {
   description: string;
   layer: "platform" | "system";
   locked: boolean;
+  template_sections?: string[];
+  starter_content?: string;
   versions: PromptVersion[];
 }
 
@@ -213,7 +215,7 @@ export function PromptWorkbenchPanel({
             const published = prompt.versions.find((version) => version.status === "published");
             return (
               <button key={prompt.prompt_id} className={selected?.prompt_id === prompt.prompt_id ? "active" : ""} onClick={() => setSelectedId(prompt.prompt_id)}>
-                <span className={`prompt-layer layer-${prompt.layer}`}>{prompt.layer === "platform" ? "策略" : "系统"}</span>
+                <span className={`prompt-layer layer-${prompt.layer}`}>{prompt.template_sections?.length ? "模板" : prompt.layer === "platform" ? "策略" : "系统"}</span>
                 <b>{prompt.name}</b>
                 <small>{prompt.locked ? "只读" : `已发布 v${published?.version_number || 1}`}</small>
               </button>
@@ -279,6 +281,7 @@ function PromptEditor({
     setNote("");
   }
   const edited = content.trim() !== (selectedVersion?.content || "").trim();
+  const isStrategyTemplate = Boolean(prompt.template_sections?.length);
   return (
     <div className="prompt-editor">
       <header>
@@ -288,6 +291,14 @@ function PromptEditor({
       <div className="prompt-editor-grid">
         <div className="prompt-content-editor">
           <div className="prompt-edit-meta"><span>{selectedVersion ? `v${selectedVersion.version_number}` : ""}</span><span className={`version-status version-${selectedVersion?.status}`}>{versionLabel(selectedVersion?.status)}</span><small>{content.length.toLocaleString()} 字符</small></div>
+          {isStrategyTemplate && <div className="strategy-template-guide">
+            <div><b>可配置策略模板</b><span>按栏目替换指标和判定规则；固定执行契约建议保留。</span></div>
+            <div className="strategy-section-chips">{prompt.template_sections?.map((section, index) => <span key={section}>{index + 1}. {section}</span>)}</div>
+            <button className="ghost" disabled={busy || content.trim() === (prompt.starter_content || "").trim()} onClick={() => {
+              setContent(prompt.starter_content || "");
+              if (!note) setNote("基于内置 PTrade 策略模板调整");
+            }}>载入 PTrade 示例模板</button>
+          </div>}
           <textarea value={content} readOnly={prompt.locked} onChange={(event) => setContent(event.target.value)} spellCheck={false} />
           {!prompt.locked && <div className="prompt-publish-bar">
             <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="本次修改说明" maxLength={500} />

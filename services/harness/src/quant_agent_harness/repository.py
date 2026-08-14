@@ -201,6 +201,21 @@ class Repository:
                         1 if definition["locked"] else 0,
                     ),
                 )
+                connection.execute(
+                    """
+                    UPDATE prompt_templates
+                    SET agent_id=?, name=?, description=?, layer=?, locked=?
+                    WHERE prompt_id=?
+                    """,
+                    (
+                        definition["agent_id"],
+                        definition["name"],
+                        definition["description"],
+                        definition["layer"],
+                        1 if definition["locked"] else 0,
+                        definition["prompt_id"],
+                    ),
+                )
                 exists = connection.execute(
                     "SELECT 1 FROM prompt_versions WHERE prompt_id=? LIMIT 1",
                     (definition["prompt_id"],),
@@ -214,6 +229,41 @@ class Repository:
                         """,
                         (str(uuid4()), definition["prompt_id"], definition["content"]),
                     )
+                elif definition.get("template_sections"):
+                    versions = connection.execute(
+                        """
+                        SELECT version_id, version_number, content, status, change_note
+                        FROM prompt_versions WHERE prompt_id=? ORDER BY version_number
+                        """,
+                        (definition["prompt_id"],),
+                    ).fetchall()
+                    published = next((row for row in versions if row["status"] == "published"), None)
+                    is_untouched_legacy = (
+                        len(versions) == 1
+                        and published is not None
+                        and str(published["change_note"]) == "系统初始版本"
+                        and "【策略配置区：用户可修改】" not in str(published["content"])
+                    )
+                    if is_untouched_legacy:
+                        next_version = int(published["version_number"]) + 1
+                        connection.execute(
+                            "UPDATE prompt_versions SET status='archived' WHERE version_id=?",
+                            (published["version_id"],),
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO prompt_versions
+                                (version_id, prompt_id, version_number, content, status,
+                                 change_note, published_at)
+                            VALUES (?, ?, ?, ?, 'published', '系统升级：量化策略模板化', CURRENT_TIMESTAMP)
+                            """,
+                            (
+                                str(uuid4()),
+                                definition["prompt_id"],
+                                next_version,
+                                definition["content"],
+                            ),
+                        )
 
     def save_report(self, report: ParsedReport) -> None:
         payload = report.model_dump_json()
@@ -424,6 +474,7 @@ class Repository:
 
     def prompt_workspace(self) -> list[dict[str, Any]]:
         active_prompt_ids = [str(item["prompt_id"]) for item in PROMPT_DEFINITIONS]
+        definitions = {str(item["prompt_id"]): item for item in PROMPT_DEFINITIONS}
         placeholders = ",".join("?" for _ in active_prompt_ids)
         with self._connect() as connection:
             templates = connection.execute(
@@ -452,6 +503,14 @@ class Repository:
                 **dict(template),
                 "locked": bool(template["locked"]),
                 "versions": by_prompt.get(str(template["prompt_id"]), []),
+                "template_sections": list(
+                    definitions.get(str(template["prompt_id"]), {}).get("template_sections", [])
+                ),
+                "starter_content": (
+                    str(definitions.get(str(template["prompt_id"]), {}).get("content", ""))
+                    if definitions.get(str(template["prompt_id"]), {}).get("template_sections")
+                    else ""
+                ),
             }
             for template in templates
         ]
