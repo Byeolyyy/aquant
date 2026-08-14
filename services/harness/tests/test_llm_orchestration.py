@@ -25,13 +25,11 @@ class FakeModel:
                 data={"selected_agents": ["quant_signal", "global_market"], "rationale": "只需要量化和外围市场。"},
                 model=self.model,
             )
-        if "title、executive_summary" in system:
+        if "news_summary、risk_notes、evidence_gaps" in system:
             return ModelResult(
                 data={
-                    "title": "模型综合",
-                    "executive_summary": "已综合。",
-                    "signal_interpretation": [],
-                    "risk_notes": [],
+                    "news_summary": ["600000.SS｜浦发银行：本轮未取得明确消息面摘要"],
+                    "risk_notes": ["600000.SS｜浦发银行：本轮未检索到明确利空消息"],
                     "evidence_gaps": ["没有外部证据"],
                 },
                 model=self.model,
@@ -80,7 +78,9 @@ class LLMOrchestrationTests(unittest.TestCase):
                 ["quant_signal", "company_industry", "global_market"],
             )
             snapshot = repository.run_snapshot(run_id)
-            self.assertEqual(snapshot["final"]["title"], "模型综合")
+            self.assertEqual(snapshot["final"]["title"], "统筹规则推荐")
+            self.assertEqual(snapshot["final"]["recommendations"][0]["symbol"], "600000.SS")
+            self.assertIn("资金公式", snapshot["final"]["signal_interpretation"][0])
             self.assertEqual(snapshot["final"]["model"], "fake-coordinator")
             silent_pass_stages = {
                 event.payload.get("stage")

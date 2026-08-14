@@ -124,6 +124,7 @@ class Repository:
                     code TEXT NOT NULL,
                     exchange TEXT NOT NULL,
                     current_name TEXT NOT NULL DEFAULT '',
+                    industry TEXT NOT NULL DEFAULT '',
                     aliases_json TEXT NOT NULL DEFAULT '[]',
                     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -180,6 +181,14 @@ class Repository:
                     ON knowledge_chunks(document_id);
                 """
             )
+            security_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(security_master)").fetchall()
+            }
+            if "industry" not in security_columns:
+                connection.execute(
+                    "ALTER TABLE security_master ADD COLUMN industry TEXT NOT NULL DEFAULT ''"
+                )
             for profile in DEFAULT_AGENT_PROFILES:
                 connection.execute(
                     "INSERT OR IGNORE INTO agent_configs(agent_id, enabled) VALUES (?, ?)",
@@ -229,7 +238,7 @@ class Repository:
                         """,
                         (str(uuid4()), definition["prompt_id"], definition["content"]),
                     )
-                elif definition.get("template_sections"):
+                elif definition.get("template_sections") or definition.get("upgrade_marker"):
                     versions = connection.execute(
                         """
                         SELECT version_id, version_number, content, status, change_note
@@ -238,11 +247,15 @@ class Repository:
                         (definition["prompt_id"],),
                     ).fetchall()
                     published = next((row for row in versions if row["status"] == "published"), None)
+                    upgrade_marker = str(
+                        definition.get("upgrade_marker")
+                        or "【策略配置区：用户可修改】"
+                    )
                     is_untouched_legacy = (
                         len(versions) == 1
                         and published is not None
                         and str(published["change_note"]) == "系统初始版本"
-                        and "【策略配置区：用户可修改】" not in str(published["content"])
+                        and upgrade_marker not in str(published["content"])
                     )
                     if is_untouched_legacy:
                         next_version = int(published["version_number"]) + 1
@@ -255,13 +268,17 @@ class Repository:
                             INSERT INTO prompt_versions
                                 (version_id, prompt_id, version_number, content, status,
                                  change_note, published_at)
-                            VALUES (?, ?, ?, ?, 'published', '系统升级：量化策略模板化', CURRENT_TIMESTAMP)
+                            VALUES (?, ?, ?, ?, 'published', ?, CURRENT_TIMESTAMP)
                             """,
                             (
                                 str(uuid4()),
                                 definition["prompt_id"],
                                 next_version,
                                 definition["content"],
+                                str(
+                                    definition.get("upgrade_change_note")
+                                    or "系统升级：量化策略模板化"
+                                ),
                             ),
                         )
 
@@ -603,10 +620,12 @@ class Repository:
                 security_id = f"CN.{exchange}.{code}"
                 name = str(stock.name or "").strip()
                 current = connection.execute(
-                    "SELECT current_name, aliases_json FROM security_master WHERE security_id=?",
+                    "SELECT current_name, industry, aliases_json FROM security_master WHERE security_id=?",
                     (security_id,),
                 ).fetchone()
                 aliases = set(json.loads(current["aliases_json"])) if current else set()
+                if current and current["industry"] and current["current_name"]:
+                    name = str(current["current_name"])
                 if name and current and current["current_name"] and current["current_name"] != name:
                     aliases.add(str(current["current_name"]))
                     connection.execute(
@@ -631,6 +650,119 @@ class Repository:
                         "INSERT OR IGNORE INTO security_name_history(security_id, name, valid_from) VALUES (?, ?, ?)",
                         (security_id, name, seen_at),
                     )
+
+    def upsert_security_master_rows(
+        self,
+        rows: list[dict[str, Any]],
+        observed_at: str,
+        *,
+        source: str = "manual_import",
+    ) -> dict[str, int]:
+        """Incrementally add or refresh stable code/name/industry mappings."""
+        counts = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0}
+        seen_at = observed_at or "unknown"
+        with self._lock, self._connect() as connection:
+            for row in rows:
+                digits = "".join(character for character in str(row.get("code") or "") if character.isdigit())
+                code = digits.zfill(6)[-6:] if digits else ""
+                if len(code) != 6:
+                    counts["skipped"] += 1
+                    continue
+                exchange = _exchange_for_code(code)
+                if not exchange:
+                    counts["skipped"] += 1
+                    continue
+                symbol = code + (".SS" if exchange == "SH" else f".{exchange}")
+                security_id = f"CN.{exchange}.{code}"
+                name = str(row.get("name") or "").strip()
+                industry = str(row.get("industry") or "").strip()
+                current = connection.execute(
+                    """
+                    SELECT current_name, industry, aliases_json
+                    FROM security_master WHERE security_id=?
+                    """,
+                    (security_id,),
+                ).fetchone()
+                aliases = set(json.loads(current["aliases_json"])) if current else set()
+                if current and _has_temporary_market_prefix(name) and current["current_name"]:
+                    name = str(current["current_name"])
+                if current and name and current["current_name"] and current["current_name"] != name:
+                    aliases.add(str(current["current_name"]))
+                    connection.execute(
+                        "UPDATE security_name_history SET valid_to=? WHERE security_id=? AND valid_to IS NULL",
+                        (seen_at, security_id),
+                    )
+                if not current:
+                    counts["added"] += 1
+                elif str(current["current_name"]) != name or str(current["industry"]) != industry:
+                    counts["updated"] += 1
+                else:
+                    counts["unchanged"] += 1
+                connection.execute(
+                    """
+                    INSERT INTO security_master
+                        (security_id, symbol, code, exchange, current_name, industry,
+                         aliases_json, first_seen_at, last_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(security_id) DO UPDATE SET
+                        symbol=excluded.symbol,
+                        current_name=CASE WHEN excluded.current_name<>'' THEN excluded.current_name ELSE security_master.current_name END,
+                        industry=CASE WHEN excluded.industry<>'' THEN excluded.industry ELSE security_master.industry END,
+                        aliases_json=excluded.aliases_json,
+                        last_seen_at=excluded.last_seen_at
+                    """,
+                    (
+                        security_id,
+                        symbol,
+                        code,
+                        exchange,
+                        name,
+                        industry,
+                        json.dumps(sorted(aliases), ensure_ascii=False),
+                        seen_at,
+                        seen_at,
+                    ),
+                )
+                if name and (not current or current["current_name"] != name):
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO security_name_history
+                            (security_id, name, valid_from, source)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (security_id, name, seen_at, source),
+                    )
+        return counts
+
+    def security_profiles(self, symbols: list[str]) -> dict[str, dict[str, str]]:
+        requested = [str(symbol).upper() for symbol in symbols]
+        codes = sorted({symbol.partition(".")[0] for symbol in requested if symbol.partition(".")[0]})
+        if not codes:
+            return {}
+        placeholders = ",".join("?" for _ in codes)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT symbol, code, exchange, current_name, industry
+                FROM security_master WHERE code IN ({placeholders})
+                """,
+                codes,
+            ).fetchall()
+        by_code = {
+            str(row["code"]): {
+                "symbol": str(row["symbol"]),
+                "code": str(row["code"]),
+                "exchange": str(row["exchange"]),
+                "name": str(row["current_name"]),
+                "industry": str(row["industry"]),
+            }
+            for row in rows
+        }
+        return {
+            symbol: by_code[symbol.partition(".")[0]]
+            for symbol in requested
+            if symbol.partition(".")[0] in by_code
+        }
 
     def record_signal_observations(
         self,
@@ -841,6 +973,21 @@ class Repository:
     def delete_secret(self, key: str) -> None:
         with self._lock, self._connect() as connection:
             connection.execute("DELETE FROM secrets WHERE secret_key=?", (key,))
+
+
+def _exchange_for_code(code: str) -> str:
+    if code.startswith(("6", "9")):
+        return "SH"
+    if code.startswith(("0", "2", "3")):
+        return "SZ"
+    if code.startswith(("4", "8")):
+        return "BJ"
+    return ""
+
+
+def _has_temporary_market_prefix(name: str) -> bool:
+    normalized = name.strip().upper()
+    return normalized.startswith(("XD", "XR", "DR", "N", "C"))
 
 
 def _run_metrics(events: list[dict[str, Any]], created_at: str, updated_at: str) -> dict[str, Any]:

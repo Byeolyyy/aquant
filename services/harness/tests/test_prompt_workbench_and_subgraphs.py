@@ -119,6 +119,41 @@ class PromptWorkbenchAndSubgraphTests(unittest.TestCase):
             self.assertIn("【策略配置区：用户可修改】", published["content"])
             self.assertEqual(legacy["status"], "archived")
 
+    def test_untouched_legacy_synthesis_prompt_is_migrated_to_rule_cards(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "test.sqlite"
+            Repository(db_path)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute("DELETE FROM prompt_versions WHERE prompt_id='coordinator.synthesis'")
+                connection.execute(
+                    """
+                    INSERT INTO prompt_versions
+                        (version_id, prompt_id, version_number, content, status, change_note, published_at)
+                    VALUES ('legacy-synthesis-v1', 'coordinator.synthesis', 1,
+                            '旧版统筹提示词，泛化总结全部 Agent 的工作过程。',
+                            'published', '系统初始版本', CURRENT_TIMESTAMP)
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            repository = Repository(db_path)
+            synthesis = next(
+                item for item in repository.prompt_workspace()
+                if item["prompt_id"] == "coordinator.synthesis"
+            )
+            published = next(item for item in synthesis["versions"] if item["status"] == "published")
+            legacy = next(
+                item for item in synthesis["versions"]
+                if item["version_id"] == "legacy-synthesis-v1"
+            )
+
+            self.assertEqual(published["version_number"], 2)
+            self.assertIn("【最终输出目标：规则推荐卡片】", published["content"])
+            self.assertEqual(legacy["status"], "archived")
+
     def test_quant_strategy_inputs_keep_custom_report_fields(self):
         report = parse_ptrade_report(
             RAW.replace(

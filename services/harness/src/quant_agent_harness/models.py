@@ -108,7 +108,8 @@ class Claim(StrictModel):
 class EvidenceItem(StrictModel):
     evidence_id: str = Field(default_factory=lambda: str(uuid4()))
     source_type: Literal[
-        "report", "local_history", "tushare", "tavily", "official_web", "public_web", "market_data"
+        "report", "local_history", "local_stable_master", "tushare", "tavily",
+        "official_web", "public_web", "market_data"
     ]
     title: str
     excerpt: str = ""

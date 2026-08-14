@@ -151,6 +151,7 @@ class Harness:
     def _run(self, run_id: str, report: ParsedReport, policy: RunPolicy) -> None:
         control = self._control(run_id)
         try:
+            self._hydrate_report_security_names(report)
             self.repository.update_run(run_id, "planning")
             self._emit(run_id, "run.status", payload={"status": "planning"})
             selected_agents, selection_rationale = self._select_agents(run_id, report)
@@ -653,6 +654,14 @@ class Harness:
             )
             raise
 
+    def _hydrate_report_security_names(self, report: ParsedReport) -> None:
+        profiles = self.repository.security_profiles([stock.symbol for stock in report.stocks])
+        for stock in report.stocks:
+            profile = profiles.get(stock.symbol.upper()) or {}
+            stable_name = str(profile.get("name") or "").strip()
+            if stable_name:
+                stock.name = stable_name
+
     def _run_quant_workflow(self, task: AgentTask, report: ParsedReport) -> AgentContribution:
         self._emit_workflow_plan(task)
         observed_at = report.generated_at or report.run_slot or task.run_id
@@ -776,16 +785,21 @@ class Harness:
             excerpt=f"selected {len(report.selected_rows)} 只，near {len(report.near_rows)} 只，解析状态 {report.parse_status}。",
             symbols=[row.symbol for row in report.stocks],
         )
-        formal = [row for row in report.selected_rows if row.reason == "all_conditions_met"]
-        formal.sort(
-            key=lambda row: (
-                -(row.super_net_wanyuan or Decimal("0")),
-                -(row.main_net_wanyuan or Decimal("0")),
-                -(row.realtime_formula_ratio_pct or Decimal("0")),
-                row.pct20 or Decimal("0"),
-                row.symbol,
+        evidence = [report_evidence]
+        stable_profiles = self.repository.security_profiles([row.symbol for row in report.stocks])
+        if stable_profiles:
+            stable_evidence = EvidenceItem(
+                source_type="local_stable_master",
+                title="本地稳定证券代码、名称与行业映射",
+                excerpt="；".join(
+                    f"{symbol} {profile.get('name') or '名称缺失'} {profile.get('industry') or '行业缺失'}"
+                    for symbol, profile in stable_profiles.items()
+                ),
+                symbols=list(stable_profiles),
             )
-        )
+            evidence.append(stable_evidence)
+        evidence_ids = [item.evidence_id for item in evidence]
+        formal = _formal_recommendation_rows(report)
         candidates: list[tuple[int, Decimal, ReportStock, list[str]]] = []
         avoided = 0
         condition_names = {
@@ -886,7 +900,7 @@ class Harness:
                         text=line,
                         kind="fact",
                         symbols=[row.symbol],
-                        evidence_ids=[report_evidence.evidence_id],
+                        evidence_ids=evidence_ids,
                         confidence="high",
                     )
                 )
@@ -901,7 +915,7 @@ class Harness:
                     2: f"其他盘口条件都通过，资金还差 {_number(gap)} 万元",
                     3: f"资金还差 {_number(gap)} 万元，同时最多只差一个盘口条件：{'、'.join(failures) or '无'}",
                 }[priority]
-                line = f"{index}. {row.symbol}（第 {priority} 优先级）：{reason}。" + _quant_metrics(row)
+                line = f"{index}. {_security_label(row)}（第 {priority} 优先级）：{reason}。" + _quant_metrics(row)
                 if run_id:
                     line += _stability_note(self.repository.signal_stability(row.symbol))
                 lines.append(line)
@@ -910,7 +924,7 @@ class Harness:
                         text=line,
                         kind="interpretation",
                         symbols=[row.symbol],
-                        evidence_ids=[report_evidence.evidence_id],
+                        evidence_ids=evidence_ids,
                         confidence="high",
                     )
                 )
@@ -931,7 +945,7 @@ class Harness:
             agent_id="quant_signal",
             summary="\n".join(lines),
             claims=claims,
-            evidence=[report_evidence],
+            evidence=evidence,
             risks=risks,
         )
 
@@ -948,6 +962,9 @@ class Harness:
         industries: list[str] = []
         snapshots: dict[str, dict] = {}
         company_stocks = (report.selected_rows or report.stocks)[:3]
+        stable_profiles = self.repository.security_profiles(
+            [stock.symbol for stock in company_stocks]
+        )
         if self.tushare_client is not None:
             with ThreadPoolExecutor(max_workers=max(1, min(3, len(company_stocks)))) as executor:
                 pending = {
@@ -976,6 +993,7 @@ class Harness:
                 stock,
                 snapshots.get(stock.symbol) or {},
                 public_by_symbol.get(stock.symbol) or {},
+                stable_profiles.get(stock.symbol.upper()) or {},
             )
             evidence.extend(result["evidence"])
             unknowns.extend(result["unknowns"])
@@ -1257,39 +1275,37 @@ class Harness:
         review: AgentContribution,
         steering: list[str],
     ) -> dict[str, object]:
-        signal = next(
-            (item for item in reversed(contributions) if item.agent_id == "quant_signal"),
-            None,
-        )
-        completed_labels = {
-            "quant_signal": "量化",
-            "company_industry": "公司行业",
-            "global_market": "外围市场",
-        }
-        completed_text = "、".join(
-            completed_labels.get(agent_id, agent_id)
-            for agent_id in dict.fromkeys(item.agent_id for item in contributions)
-        )
-        evidence_count = sum(len(item.evidence) for item in contributions)
-        external_count = sum(
-            1 for item in contributions for evidence in item.evidence if evidence.source_type != "report"
-        )
+        recommendations = _recommendation_cards(report, contributions, review)
+        recommendation_labels = [str(item["label"]) for item in recommendations]
+        if recommendations:
+            executive_summary = (
+                f"按既定量化规则，本轮推荐关注 {len(recommendations)} 只："
+                + "、".join(recommendation_labels)
+                + "。以下只保留入选量化依据、消息面和具体风险。"
+            )
+        else:
+            executive_summary = "按既定量化规则，本轮没有股票满足正式推荐条件。"
+        evidence_gaps = _material_evidence_gaps(report, contributions, review)
         fallback: dict[str, object] = {
-            "title": "PTrade 多 Agent 研究摘要",
+            "title": "统筹规则推荐",
             "report_id": report.report_id,
             "parse_status": report.parse_status,
-            "executive_summary": (
-                f"本轮已完成{completed_text}分析和风险汇总。"
-                f"共登记 {evidence_count} 条资料，其中外部资料 {external_count} 条。"
-                + ("报告解析不完整，结论需降低置信度。" if report.parse_status != "valid" else "")
-            ),
-            "signal_interpretation": signal.summary if signal else "本轮没有量化结果。",
-            "risk_notes": review.summary,
-            "evidence_gaps": review.unknowns,
+            "executive_summary": executive_summary,
+            "recommendations": recommendations,
+            "signal_interpretation": [
+                f"{item['label']}：{item['quant_summary']}" for item in recommendations
+            ],
+            "news_summary": [
+                f"{item['label']}：{item['news_summary']}" for item in recommendations
+            ],
+            "risk_notes": [
+                f"{item['label']}：{item['risk_summary']}" for item in recommendations
+            ],
+            "evidence_gaps": evidence_gaps,
             "contributions": [item.model_dump(mode="json") for item in contributions],
             "risk_review": review.model_dump(mode="json"),
             "steering_applied": steering,
-            "disclaimer": "仅供研究解读与风险提示，不构成买卖或仓位建议。",
+            "disclaimer": "规则筛选结果仅供研究，不构成交易指令。",
         }
         if self.llm_client is None:
             return fallback
@@ -1298,8 +1314,17 @@ class Harness:
             {
                 "report_id": report.report_id,
                 "parse_status": report.parse_status,
-                "contributions": [item.model_dump(mode="json") for item in contributions],
-                "risk_review": review.model_dump(mode="json"),
+                "rule_recommendations": recommendations,
+                "compact_evidence": [
+                    {
+                        "symbol": item["symbol"],
+                        "name": item["name"],
+                        "news_summary": item["news_summary"],
+                        "risk_summary": item["risk_summary"],
+                    }
+                    for item in recommendations
+                ],
+                "risk_review_unknowns": evidence_gaps,
                 "steering": steering,
             },
             ensure_ascii=False,
@@ -1308,15 +1333,26 @@ class Harness:
         try:
             result = self.llm_client.complete_json(system, user)
             data = result.data
-            required = {"title", "executive_summary", "signal_interpretation", "risk_notes", "evidence_gaps"}
+            required = {"news_summary", "risk_notes", "evidence_gaps"}
             if not required.issubset(data):
                 raise ValueError("统筹模型输出缺少必需字段")
-            data.update(
+            symbols = [str(item["symbol"]) for item in recommendations]
+            final = dict(fallback)
+            final.update(
                 {
-                    "report_id": report.report_id,
-                    "parse_status": report.parse_status,
-                    "steering_applied": steering,
-                    "disclaimer": "仅供研究解读与风险提示，不构成买卖或仓位建议。",
+                    "news_summary": _merge_symbol_summaries(
+                        data.get("news_summary"),
+                        fallback["news_summary"],
+                        symbols,
+                    ),
+                    "risk_notes": _merge_symbol_summaries(
+                        data.get("risk_notes"),
+                        fallback["risk_notes"],
+                        symbols,
+                    ),
+                    "evidence_gaps": _compact_model_list(
+                        data.get("evidence_gaps"), evidence_gaps, limit=3
+                    ),
                     "model": result.model,
                 }
             )
@@ -1330,7 +1366,7 @@ class Harness:
                     "completion_tokens": result.completion_tokens,
                 },
             )
-            return data
+            return final
         except Exception as exc:
             self._emit(
                 run_id,
@@ -1571,7 +1607,186 @@ def _quant_metrics(row: ReportStock) -> str:
 
 
 def _quant_stock_line(row: ReportStock, *, index: int, pool: str) -> str:
-    return f"{index}. {row.symbol}（{pool}）：" + _quant_metrics(row)
+    return f"{index}. {_security_label(row)}（{pool}）：" + _quant_metrics(row)
+
+
+def _security_label(row: ReportStock) -> str:
+    name = str(row.name or "").strip()
+    return f"{row.symbol}｜{name}" if name else row.symbol
+
+
+def _formal_recommendation_rows(report: ParsedReport) -> list[ReportStock]:
+    rows = [row for row in report.selected_rows if row.reason == "all_conditions_met"]
+    rows.sort(
+        key=lambda row: (
+            -(row.super_net_wanyuan or Decimal("0")),
+            -(row.main_net_wanyuan or Decimal("0")),
+            -(row.realtime_formula_ratio_pct or Decimal("0")),
+            row.pct20 or Decimal("0"),
+            row.symbol,
+        )
+    )
+    return rows
+
+
+def _recommendation_cards(
+    report: ParsedReport,
+    contributions: list[AgentContribution],
+    review: AgentContribution,
+) -> list[dict[str, object]]:
+    cards: list[dict[str, object]] = []
+    for row in _formal_recommendation_rows(report):
+        formula = row.realtime_formula_wanyuan or Decimal("0")
+        threshold = row.flow_threshold_wanyuan or Decimal("0")
+        surplus = formula - threshold
+        quant_summary = (
+            f"资金公式 {_number(formula)} 万元，门槛 {_number(threshold)} 万元，"
+            f"高出 {_number(surplus)} 万元；主力净额 {_number(row.main_net_wanyuan)} 万元；"
+            f"量比 {_number(row.vol_ratio)}，换手率 {_number(row.turnover_now_pct)}%"
+        )
+        cards.append(
+            {
+                "symbol": row.symbol,
+                "name": str(row.name or ""),
+                "label": _security_label(row),
+                "rule_status": "正式通过全部核心条件",
+                "quant_summary": quant_summary,
+                "news_summary": _news_summary_for_symbol(
+                    contributions, row.symbol, str(row.name or "")
+                ),
+                "risk_summary": _risk_summary_for_symbol(review, row.symbol),
+            }
+        )
+    return cards
+
+
+def _news_summary_for_symbol(
+    contributions: list[AgentContribution],
+    symbol: str,
+    name: str,
+) -> str:
+    priority = {"official_web": 0, "public_web": 1, "tavily": 2}
+    candidates: list[tuple[int, str, str]] = []
+    seen: set[str] = set()
+    for contribution in contributions:
+        if contribution.agent_id != "company_industry":
+            continue
+        for item in contribution.evidence:
+            if symbol not in item.symbols or item.source_type not in priority:
+                continue
+            title = re.sub(r"\s+", " ", str(item.title or "")).strip()
+            if not title or title in seen:
+                continue
+            if item.source_type != "official_web":
+                code = symbol.partition(".")[0]
+                if not any(value and value in title for value in (name, code, symbol)):
+                    continue
+            seen.add(title)
+            candidates.append(
+                (
+                    priority[item.source_type],
+                    str(item.published_at or "日期待核验"),
+                    title[:120],
+                )
+            )
+    candidates.sort(key=lambda value: value[0])
+    if not candidates:
+        return "本轮未取得明确消息面摘要"
+    return "；".join(f"{date}《{title}》" for _priority, date, title in candidates[:2])
+
+
+def _risk_summary_for_symbol(review: AgentContribution, symbol: str) -> str:
+    lines = str(review.summary or "").splitlines()
+    start = next(
+        (index for index, line in enumerate(lines) if line.strip().startswith(symbol)),
+        None,
+    )
+    if start is not None:
+        section: list[str] = []
+        for line in lines[start + 1 :]:
+            stripped = line.strip()
+            if re.match(r"^\d{6}\.(?:SS|SZ|BJ)(?:｜|$)", stripped):
+                break
+            if stripped.startswith("-"):
+                item = re.sub(
+                    r"[（(]evidence_id:[^)）]+[)）]",
+                    "",
+                    stripped.lstrip("- "),
+                )
+                if any(
+                    phrase in item
+                    for phrase in ("未明确提及", "仅因检索命中", "是否涉及该公司", "无明确关联")
+                ):
+                    continue
+                section.append(item.strip("； "))
+            elif stripped and not section:
+                section.append(stripped)
+            if len(section) >= 2:
+                break
+        if section:
+            return "；".join(item[:160] for item in section)
+        return "截至报告日，本轮未检索到与该公司明确相关的利空消息；不代表不存在其他风险"
+    evidence = [
+        item
+        for item in review.evidence
+        if symbol in item.symbols and item.source_type in {"official_web", "public_web", "tavily"}
+    ]
+    if evidence:
+        return "；".join(
+            f"{item.published_at or '日期待核验'}《{str(item.title)[:120]}》"
+            for item in evidence[:2]
+        )
+    return "截至报告日，本轮未检索到明确利空消息；不代表不存在其他风险"
+
+
+def _material_evidence_gaps(
+    report: ParsedReport,
+    contributions: list[AgentContribution],
+    review: AgentContribution,
+) -> list[str]:
+    gaps: list[str] = []
+    if report.parse_status != "valid":
+        gaps.append("报告解析不完整，部分量化字段缺失可能影响排序可靠性。")
+    for value in [*review.unknowns, *(item for contribution in contributions for item in contribution.unknowns)]:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if any(token in text for token in ("IncompleteRead", "ReadTimeout", "ConnectTimeout")):
+            match = re.search(r"\b\d{6}\.(?:SS|SZ|BJ)\b", text)
+            text = (
+                f"{match.group(0)} 联网补查未完成，消息面可能不完整。"
+                if match
+                else "部分联网补查未完成，消息面可能不完整。"
+            )
+        if text and text not in gaps:
+            gaps.append(text[:220])
+        if len(gaps) >= 3:
+            break
+    return gaps
+
+
+def _compact_model_list(value: object, fallback: object, *, limit: int) -> list[str]:
+    items = value if isinstance(value, list) else []
+    cleaned = [re.sub(r"\s+", " ", str(item)).strip() for item in items]
+    cleaned = [item for item in cleaned if item]
+    if cleaned:
+        return cleaned[:limit]
+    return [str(item) for item in fallback][:limit] if isinstance(fallback, list) else []
+
+
+def _merge_symbol_summaries(
+    value: object,
+    fallback: object,
+    symbols: list[str],
+) -> list[str]:
+    fallback_items = [str(item) for item in fallback] if isinstance(fallback, list) else []
+    candidate_items = _compact_model_list(value, [], limit=max(1, len(symbols) * 2))
+    merged: list[str] = []
+    for index, symbol in enumerate(symbols):
+        candidate = next((item for item in candidate_items if symbol in item), "")
+        if candidate:
+            merged.append(candidate)
+        elif index < len(fallback_items):
+            merged.append(fallback_items[index])
+    return merged
 
 
 def _stability_note(value: dict) -> str:
@@ -1597,14 +1812,27 @@ def _named_values(values: dict, labels: dict[str, str]) -> str:
     )
 
 
-def _company_stock_details(stock: ReportStock, snapshot: dict, public_bundle: dict) -> dict:
-    basic = snapshot.get("basic") or {}
+def _company_stock_details(
+    stock: ReportStock,
+    snapshot: dict,
+    public_bundle: dict,
+    stable_profile: dict | None = None,
+) -> dict:
+    stable_profile = stable_profile or {}
+    live_basic = snapshot.get("basic") or {}
+    basic = live_basic
     company = snapshot.get("company") or {}
     daily = snapshot.get("daily_basic") or {}
     financial = snapshot.get("financial_indicator") or {}
     forecast = snapshot.get("forecast") or {}
-    name = str(basic.get("name") or company.get("com_name") or stock.name or stock.symbol)
-    industry = str(basic.get("industry") or "")
+    name = str(
+        stable_profile.get("name")
+        or basic.get("name")
+        or company.get("com_name")
+        or stock.name
+        or stock.symbol
+    )
+    industry = str(stable_profile.get("industry") or basic.get("industry") or "")
     industry_label = industry or "行业未核验"
     evidence: list[EvidenceItem] = []
     evidence_ids: list[str] = []
@@ -1620,12 +1848,22 @@ def _company_stock_details(stock: ReportStock, snapshot: dict, public_bundle: di
         identity.append(f"地区 {company.get('province') or ''}{company.get('city') or ''}")
     if company.get("introduction"):
         identity.append("公司简介 " + str(company["introduction"])[:300])
-    if basic or company:
+    if live_basic or company:
         item = EvidenceItem(
             source_type="tushare",
             title=f"{stock.symbol} {name} · 公司与行业基础资料",
             excerpt="；".join(identity),
             url="https://tushare.pro/",
+            symbols=[stock.symbol],
+        )
+        evidence.append(item)
+        evidence_ids.append(item.evidence_id)
+    stable_fields_used = bool(stable_profile.get("name") or stable_profile.get("industry"))
+    if stable_fields_used:
+        item = EvidenceItem(
+            source_type="local_stable_master",
+            title=f"{stock.symbol} {name} · 本地稳定证券映射",
+            excerpt=f"名称 {name}；行业 {industry_label}",
             symbols=[stock.symbol],
         )
         evidence.append(item)
@@ -1750,7 +1988,7 @@ def _risk_search_scope(
     names: dict[str, str] = {row.symbol: row.name for row in ordered if row.name}
     for contribution in contributions:
         for item in contribution.evidence:
-            if item.source_type != "tushare":
+            if item.source_type not in {"tushare", "local_stable_master"}:
                 continue
             for symbol in item.symbols:
                 if names.get(symbol):

@@ -28,12 +28,14 @@ describe("eventSummary", () => {
       payload: {
         executive_summary: "总体结论",
         signal_interpretation: ["信号一", "信号二"],
+        news_summary: ["600000.SS｜浦发银行：消息面平稳"],
         risk_notes: "注意风险",
       },
     });
     expect(summary).toContain("总体结论");
-    expect(summary).toContain("信号解读");
+    expect(summary).toContain("量化依据");
     expect(summary).toContain("• 信号一");
+    expect(summary).toContain("消息面");
   });
 
   it("keeps Agent plans but filters Harness lifecycle events", () => {
