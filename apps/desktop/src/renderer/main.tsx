@@ -105,21 +105,12 @@ interface RunSnapshot {
   metrics: RunMetrics;
 }
 
-const SAMPLE_REPORT = `生成时间: 2026-07-31 14:30:00
-运行轮次: 1430
-selected_head:
-symbol reason realtime_formula_wanyuan flow_threshold_wanyuan vol_ratio turnover_now_pct l4_buy_sell super_large_anomaly
-600000.SS all_conditions_met 4300 4000 1.20 2.50 True False
-near_head:
-symbol reason realtime_formula_wanyuan flow_threshold_wanyuan vol_ratio turnover_now_pct l4_buy_sell super_large_anomaly
-000001.SZ near_miss 3500 4000 1.05 3.10 False False`;
-
 const ROSTER = ["coordinator", "quant_signal", "company_industry", "global_market", "risk"] as const;
 
 function App() {
   const [service, setService] = useState<"connecting" | "ready" | "error">("connecting");
   const [serviceDetail, setServiceDetail] = useState("正在启动本地 Harness…");
-  const [rawText, setRawText] = useState(SAMPLE_REPORT);
+  const [rawText, setRawText] = useState("");
   const [report, setReport] = useState<ParsedReport | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
   const [events, setEvents] = useState<HarnessEvent[]>([]);
@@ -299,6 +290,7 @@ function App() {
     setEvents([]);
     setSnapshotMetrics(null);
     setError("");
+    setRawText("");
   }
 
   async function openRun(run: RunSummary) {
@@ -415,9 +407,9 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand-mark">Q</div>
+        <div className="brand-mark">A</div>
         <div>
-          <strong>QuantAgent</strong>
+          <strong>aquant</strong>
         </div>
         <div className={`service-chip ${service}`} title={serviceDetail}>
           <i />
@@ -432,10 +424,10 @@ function App() {
       <aside className="sidebar">
         <div className="section-label">工作台</div>
         <nav className="workspace-nav">
-          <button className={activeView === "research" ? "active" : ""} onClick={() => setActiveView("research")}><span>⌁</span><b>实时研究</b></button>
-          <button className={activeView === "runs" ? "active" : ""} onClick={() => { setActiveView("runs"); void loadRuns(); }}><span>◫</span><b>运行记录</b><small>{runs.length}</small></button>
-          <button className={activeView === "agents" ? "active" : ""} onClick={() => { setActiveView("agents"); void loadAgents(); }}><span>◇</span><b>Agent 管理</b></button>
-          <button className={activeView === "prompts" ? "active" : ""} onClick={() => { setActiveView("prompts"); void loadPrompts(); void loadWorkflows(); }}><span>⌘</span><b>Prompt 工作台</b></button>
+          <button className={activeView === "research" ? "active" : ""} onClick={() => setActiveView("research")}><span>研</span><b>实时研究</b></button>
+          <button className={activeView === "runs" ? "active" : ""} onClick={() => { setActiveView("runs"); void loadRuns(); }}><span>记</span><b>运行记录</b><small>{runs.length}</small></button>
+          <button className={activeView === "agents" ? "active" : ""} onClick={() => { setActiveView("agents"); void loadAgents(); }}><span>员</span><b>Agent 管理</b></button>
+          <button className={activeView === "prompts" ? "active" : ""} onClick={() => { setActiveView("prompts"); void loadPrompts(); void loadWorkflows(); }}><span>令</span><b>Prompt 工作台</b></button>
         </nav>
         <div className="section-label agents-label">Agent 团队</div>
         {ROSTER.map((agentId) => (
@@ -462,7 +454,7 @@ function App() {
               <div className="eyebrow">新研究事件</div>
               <h2>粘贴一份 PTrade 原始报告</h2>
               <p>先预览解析结果，确认后再启动多 Agent 研究。</p>
-              <textarea value={rawText} onChange={(event) => setRawText(event.target.value)} spellCheck={false} />
+              <textarea value={rawText} onChange={(event) => setRawText(event.target.value)} placeholder="在此粘贴 PTrade 原始报告…" spellCheck={false} />
               <div className="card-actions">
                 <span>{rawText.length.toLocaleString()} 字符</span>
                 <button className="primary" disabled={busy || !rawText.trim()} onClick={parseReport}>
