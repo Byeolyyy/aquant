@@ -1,6 +1,6 @@
-# QuantAgent Research Room
+# aquant Research Room
 
-QuantAgent 是一个面向 PTrade 报告的本地优先 Windows 多 Agent 研究桌面应用。它采用“确定性外层 Harness + 动态 Agent 内层”：Harness 负责解析、权限、预算、审计和终止；统筹 Agent 根据每份报告选择专家、派发任务并形成最终综合。
+aquant 是一个面向 PTrade 报告的本地优先 Windows 多 Agent 研究桌面应用。它采用“确定性外层 Harness + 动态 Agent 内层”：Harness 负责解析、权限、预算、审计和终止；统筹 Agent 根据每份报告选择专家、派发任务并形成最终综合。
 
 当前仓库已经完成一个可运行、可治理、可审计的桌面纵向切片：
 

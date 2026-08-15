@@ -26,8 +26,8 @@ function createWindow(): BrowserWindow {
     height: 940,
     minWidth: 1120,
     minHeight: 720,
-    backgroundColor: "#07111f",
-    title: "QuantAgent Research Room",
+    backgroundColor: "#f7f2e7",
+    title: "aquant · 研房",
     webPreferences: {
       preload: path.join(currentDir, "preload.cjs"),
       contextIsolation: true,
@@ -76,7 +76,7 @@ app.whenReady().then(async () => {
     const owner = BrowserWindow.fromWebContents(event.sender);
     const options = {
       title: "导出研究报告",
-      defaultPath: `QuantAgent-${runId.slice(0, 8)}.md`,
+      defaultPath: `aquant-${runId.slice(0, 8)}.md`,
       filters: [{ name: "Markdown", extensions: ["md"] }],
     };
     const selected = owner
@@ -117,7 +117,7 @@ function snapshotToMarkdown(snapshot: Record<string, unknown>): string {
     evidence_risk: "证据与风险 Agent（历史）",
   };
   const lines = [
-    `# ${String(final.title || "QuantAgent 研究报告")}`,
+    `# ${String(final.title || "aquant 研究报告")}`,
     "",
     `- Run ID: \`${String(snapshot.run_id || "")}\``,
     `- 状态: ${String(snapshot.status || "")}`,

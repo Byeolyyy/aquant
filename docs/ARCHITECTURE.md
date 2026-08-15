@@ -1,4 +1,4 @@
-# QuantAgent 架构说明
+# aquant 架构说明
 
 ## 1. Agent 与 Workflow 的边界
 
