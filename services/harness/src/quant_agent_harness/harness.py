@@ -1066,7 +1066,7 @@ class Harness:
         evidence: list[EvidenceItem] = []
         claims: list[Claim] = []
         lines = [str(snapshot.get("notice") or "外围指数数据不可用。")]
-        for region in ("美国", "韩国"):
+        for region in ("美国", "韩国", "日本"):
             regional = [item for item in indices if item.get("region") == region]
             if not regional:
                 continue
@@ -1480,7 +1480,7 @@ class Harness:
         return {
             "quant_signal": "检查量化信号与数据质量",
             "company_industry": "核验公司与行业背景",
-            "global_market": "汇总美股与韩国核心指数走势",
+            "global_market": "汇总美股、韩国与日本核心指数走势",
             "risk": "逐票检索近期负面公告与新闻",
         }.get(agent_id, "执行专业分析")
 
@@ -1521,7 +1521,7 @@ def _agent_responsibility(agent_id: str) -> str:
     return {
         "quant_signal": "复核 PTrade 量化字段、正式观察和候选规则，只解释确定性数据",
         "company_industry": "查询公司身份、财务、公告、新闻和行业资料，可按统筹问题补查",
-        "global_market": "核对报告日对应的美股与韩国指数日期、点位和涨跌",
+        "global_market": "核对报告日对应的美股、韩国与日本指数日期、点位和涨跌",
         "risk": "逐票检索报告日前的负面公告和新闻，并总结有来源的潜在利空",
     }.get(agent_id, "执行现有职责范围内的补充分析")
 

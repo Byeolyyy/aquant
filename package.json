@@ -12,6 +12,7 @@
     "build": "npm --workspace @quant-agent/desktop run build",
     "test": "npm --workspace @quant-agent/desktop run test",
     "test:python": "cross-env PYTHONPATH=services/harness/src python -m unittest discover -s services/harness/tests -v",
+    "package:win": "npm --workspace @quant-agent/desktop run package:win",
     "setup:electron": "install-electron"
   },
   "engines": {

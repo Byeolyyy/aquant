@@ -49,6 +49,10 @@ REQUIRED_FIELDS = {
 EMPTY_VALUES = {"", "-", "--", "none", "null", "nan", "n/a"}
 VALID_CODE_PREFIXES = ("0", "3", "4", "6", "8", "9")
 REASON_VALUES = {"all_conditions_met", "near_miss", "abnormal", "selected", "candidate"}
+# 邮件页脚（以及被截断后与页脚粘连的尾部残片）不能进入区段内容。
+# 页脚本身不是数据行；粘连行既可能缺列，也可能把 "14:16:46}" 这类
+# 页脚残片误对齐进 reason 等列，直接丢弃整行、保留前面的完整行。
+MAIL_FOOTER_RE = re.compile(r"邮件发送时间|sent_at", re.I)
 
 
 def parse_ptrade_report(raw_text: str) -> ParsedReport:
@@ -73,8 +77,14 @@ def parse_ptrade_report(raw_text: str) -> ParsedReport:
         sections.get("near", []), "near", diagnostics, parse_errors
     )
 
-    if "selected" not in sections or "near" not in sections:
-        parse_errors.append("报告必须同时包含 selected_head 和 near_head")
+    # 邮件可能在两个区段之间被截断（例如 selected_head 之后直接跟页脚）。
+    # 缺失的区段按空池处理并记为诊断，保留已解析完整的行；
+    # 只有完全没有任何区段标记时才 fail closed。
+    for pool, marker in (("selected", "selected_head"), ("near", "near_head")):
+        if pool not in sections:
+            diagnostics.append(f"缺少 {marker} 区段（可能被邮件截断）")
+    if "selected" not in sections and "near" not in sections:
+        parse_errors.append("报告必须包含 selected_head 或 near_head 区段")
 
     selected_incomplete = [row for row in selected_rows if row.missing_fields]
     near_incomplete = [row for row in near_rows if row.missing_fields]
@@ -156,7 +166,11 @@ def _extract_sections(raw_text: str) -> tuple[dict[str, list[str]], list[str]]:
         elif inline.lower() in {"empty", "[]", "none"}:
             sections[section] = []
             continue
-        content.extend(line.strip() for line in lines[line_index + 1 : next_index] if line.strip())
+        content.extend(
+            line.strip()
+            for line in lines[line_index + 1 : next_index]
+            if line.strip() and not MAIL_FOOTER_RE.search(line)
+        )
         sections[section] = content
     return sections, errors
 

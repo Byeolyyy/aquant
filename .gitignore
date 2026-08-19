@@ -16,4 +16,7 @@ artifacts/
 .env
 .env.*
 !.env.example
+release/
+build/
+apps/desktop/resources/harness/
 新建 文本文档.txt

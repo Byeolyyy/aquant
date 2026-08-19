@@ -2,6 +2,8 @@
   "name": "@quant-agent/desktop",
   "version": "0.1.0",
   "private": true,
+  "description": "aquant 研房 - 本地优先的 A 股多 Agent 研究桌面应用",
+  "author": "Byeolyyy",
   "type": "module",
   "main": "dist-electron/main/main.js",
   "scripts": {
@@ -10,13 +12,21 @@
     "build:main": "tsc -p tsconfig.main.json",
     "build:renderer": "vite build",
     "build": "npm run build:main && npm run build:renderer",
+    "package:win": "npm run build && node scripts/copy-harness.mjs && electron-builder --win dir --x64",
     "test": "vitest run"
   },
-  "dependencies": {
-    "@vitejs/plugin-react": "latest",
-    "vite": "latest",
-    "react": "latest",
-    "react-dom": "latest"
+  "build": {
+    "appId": "com.aquant.research",
+    "productName": "aquant",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "extraResources": [
+      { "from": "resources/harness", "to": "harness" }
+    ],
+    "directories": { "output": "release" },
+    "win": { "target": ["dir"] }
   },
   "devDependencies": {
     "@types/node": "latest",
@@ -24,7 +34,8 @@
     "@types/react-dom": "latest",
     "concurrently": "9.2.4",
     "cross-env": "latest",
-    "electron": "latest",
+    "electron": "43.1.1",
+    "electron-builder": "^26.15.3",
     "typescript": "latest",
     "vitest": "latest",
     "wait-on": "latest"
