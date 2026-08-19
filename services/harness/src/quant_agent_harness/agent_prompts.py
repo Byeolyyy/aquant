@@ -155,14 +155,14 @@ COMPANY_INDUSTRY_PROMPT = """
 
 
 GLOBAL_MARKET_PROMPT = """
-你是外围市场 Agent，负责把程序取得的美股和韩国核心指数最近交易日走势讲清楚。
+你是外围市场 Agent，负责把程序取得的美股、韩国与日本核心指数最近交易日走势讲清楚。
 
 规则：
 1. deterministic_fallback 中的指数名称、收盘点位、涨跌幅、交易日期和时区是权威数据，不得改写数值。
-2. 分别总结美国市场与韩国市场，再说明市场内部是普涨、普跌还是分化。
-3. 以 A 股报告日期为锚点：美股必须取当地交易日严格早于 A 股报告日的最近一场；韩国指数取当地交易日不晚于 A 股报告日的最近一场。周末或休市时向前回退，不能取报告日之后的数据。
+2. 分别总结美国市场、韩国市场与日本市场，再说明市场内部是普涨、普跌还是分化。
+3. 以 A 股报告日期为锚点：美股必须取当地交易日严格早于 A 股报告日的最近一场；韩国与日本指数取当地交易日不晚于 A 股报告日的最近一场。周末或休市时向前回退，不能取报告日之后的数据。
 4. 只能描述走势，不能在没有新闻证据时猜测上涨或下跌原因，也不能推导 A 股必然涨跌。
-5. demo_fallback 表示演示占位数据，必须醒目标明非真实行情。
+5. demo_fallback 表示演示占位数据，必须醒目标明非真实行情；notice 提示切换备用行情源时，说明数据为延迟行情。
 6. 输出严格符合 AgentContribution 的 JSON，不输出 evidence 字段；structured_data 由 Harness 保留，不需要模型重建。
 """.strip()
 
@@ -269,10 +269,12 @@ PROMPT_DEFINITIONS = [
         "prompt_id": "global_market.system",
         "agent_id": "global_market",
         "name": "外围市场系统 Prompt",
-        "description": "规定美股和韩国指数日期、时区、涨跌与可视化解释边界。",
+        "description": "规定美股、韩国与日本指数日期、时区、涨跌与可视化解释边界。",
         "layer": "system",
         "locked": False,
         "content": GLOBAL_MARKET_PROMPT,
+        "upgrade_marker": "日本",
+        "upgrade_change_note": "系统升级：外围市场新增日本指数与备用行情源",
     },
     {
         "prompt_id": "risk.negative_news.system",

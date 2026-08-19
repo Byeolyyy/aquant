@@ -35,13 +35,16 @@ export class HarnessSidecar {
       ? path.resolve(process.env.QUANT_AGENT_ROOT)
       : path.resolve(currentDir, "../../../..");
     const pythonPath = process.env.QUANT_AGENT_PYTHON || "python";
+    const harnessExe = app.isPackaged
+      ? path.join(process.resourcesPath, "harness", "quant-agent-harness.exe")
+      : null;
     const harnessSource = path.join(projectRoot, "services", "harness", "src");
     const existingPythonPath = process.env.PYTHONPATH || "";
     const pythonModulePath = existingPythonPath
       ? `${harnessSource}${path.delimiter}${existingPythonPath}`
       : harnessSource;
 
-    this.process = spawn(pythonPath, ["-m", "quant_agent_harness.server"], {
+    this.process = spawn(harnessExe ?? pythonPath, harnessExe ? [] : ["-m", "quant_agent_harness.server"], {
       cwd: projectRoot,
       windowsHide: true,
       env: {

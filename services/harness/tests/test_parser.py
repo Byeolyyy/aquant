@@ -70,6 +70,46 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(report.generated_at, "2026-07-31 14:31:56")
         self.assertEqual(report.report_date, "2026-07-31")
 
+    def test_truncated_tail_and_footer_keep_complete_rows(self):
+        # 邮件在最后一个数据行处被截断，尾部残片与页脚粘连，
+        # 且 near_head 区段整体丢失：完整行必须保留，缺失区段只是诊断。
+        report = parse_ptrade_report(
+            "生成时间:{2026-08-17 14:15:00}\n"
+            "selected_head:\n" + HEADER + "\n"
+            "600000.SS -18 2.5 1.2 3000 1000 0 4300 4000 False False all_conditions_met\n"
+            "601133.SS -11.9 2.7 1.4 4000 4300 0 4371 4000 False False all_conditions_met\n"
+            "605589.S}邮件发送时间:{2026-08-17 14:16:46}"
+        )
+        self.assertNotEqual(report.parse_status, "invalid")
+        self.assertEqual([row.symbol for row in report.selected_rows], ["600000.SS", "601133.SS"])
+        self.assertEqual(report.near_rows, [])
+        self.assertEqual(report.report_date, "2026-08-17")
+        self.assertTrue(any("缺少 near_head" in item for item in report.diagnostics))
+        self.assertFalse(any("无效" in item for item in report.diagnostics))
+
+    def test_footer_glued_to_complete_row_is_dropped_not_misaligned(self):
+        # 页脚粘连在完整数据行末尾时，该行整体丢弃，
+        # 绝不能把 "14:16:46}" 之类的页脚残片对齐进 reason 等列。
+        report = parse_ptrade_report(
+            "selected_head:\n" + HEADER + "\n"
+            "600000.SS -18 2.5 1.2 3000 1000 0 4300 4000 False False all_conditions_met\n"
+            "601133.SS -11.9 2.7 1.4 4000 4300 0 4371 4000 False False all_conditions_met}邮件发送时间:{2026-08-17 14:16:46}\n"
+            "near_head: empty"
+        )
+        self.assertEqual(report.parse_status, "valid")
+        self.assertEqual([row.symbol for row in report.selected_rows], ["600000.SS"])
+        self.assertTrue(all(row.reason == "all_conditions_met" for row in report.selected_rows))
+
+    def test_footer_only_table_still_fails_closed(self):
+        # 整张表都被截断只剩表头和页脚时，没有任何完整行可保留，必须 fail closed。
+        report = parse_ptrade_report(
+            "selected_head:\n" + HEADER + "\n"
+            "邮件发送时间:{2026-08-17 14:16:46}\n"
+            "near_head: empty"
+        )
+        self.assertEqual(report.parse_status, "invalid")
+        self.assertEqual(report.selected_rows, [])
+
 
 if __name__ == "__main__":
     unittest.main()

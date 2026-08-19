@@ -176,7 +176,7 @@ DEFAULT_AGENT_PROFILES = [
         agent_id="global_market",
         display_name="外围市场 Agent",
         lane="global_market",
-        description="汇总美股和韩国核心指数最近交易日走势，并生成可视化。",
+        description="汇总美股、韩国与日本核心指数最近交易日走势，并生成可视化。",
         tool_allowlist=["global_index_snapshot"],
     ),
     AgentProfile(

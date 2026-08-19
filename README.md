@@ -1,35 +1,36 @@
-# aquant Research Room
+# aquant
 
-aquant 是一个面向 PTrade 报告的本地优先 Windows 多 Agent 研究桌面应用。它采用“确定性外层 Harness + 动态 Agent 内层”：Harness 负责解析、权限、预算、审计和终止；统筹 Agent 根据每份报告选择专家、派发任务并形成最终综合。
+aquant is a local-first Windows desktop app that turns a pasted PTrade quant report into an evidence-backed, auditable research brief. It pairs a deterministic outer harness (parsing, permissions, budgets, auditing, termination) with a dynamic inner layer of expert agents: a coordinator Agent picks the experts each report needs, dispatches them in parallel, reviews their work, and writes the final synthesis.
 
-当前仓库已经完成一个可运行、可治理、可审计的桌面纵向切片：
+The repository currently contains a runnable, governed, auditable desktop vertical slice:
 
-- Electron + React 三栏桌面界面。
-- Python JSONL sidecar 与版本化 IPC。
-- PTrade 原始文本的确定性解析和确认预览。
-- 5 个默认 Agent：统筹、量化信号、公司与行业、外围市场、风险。
-- 根据报告动态选择专家，而不是固定轮询全员。
-- 专家并行执行后由统筹 Agent 主动审阅；发现矛盾、重大信息或证据缺口时，可带着具体问题再次调用现有子 Agent。
-- 所有自主追问受现有 Agent 白名单、重复任务过滤和 `max_rounds` 轮数限制，不允许模型凭空创造新角色。
-- 风险 Agent 逐票检索报告日前的潜在利空，统筹再次审阅后再形成最终综合。
-- 暂停、取消和节点边界插话协议。
-- SQLite 报告、运行和有序事件持久化。
-- 应用内运行记录：查看历史 Run、观测耗时/证据/风险/模型调用、一键重跑和 Markdown 导出。
-- 应用内 Agent 管理：可选 Agent 启停、项目级附加要求、配置版本；核心治理角色不可停用。
-- 应用内 Prompt 工作台：直接查看完整系统 Prompt，保存草稿、发布、查看历史版本和回滚；平台安全策略只读。
-- 每个任务记录实际使用的 Agent 配置、Prompt 版本和子工作流版本。
-- 量化信号 demo 子工作流：证券稳定 ID/名称历史、PTrade 确定性规则、逐 Run 信号观察和稳定性统计。
-- 外围市场 demo 子工作流：以 A 股报告日为锚点，美股取严格早于报告日的最近交易日，韩股取不晚于报告日的最近交易日，再标准化涨跌并生成五日折线图。
-- Agent 生命周期与模型用量事件：保存阶段耗时、Evidence、风险、Token、失败与回退指标。
-- 应用内“连接与密钥”设置中心：模型、Tushare 与 Tavily 均可保存和测试连接。
-- 公司与行业 Agent 已接入 Tushare、巨潮公告、东方财富新闻与研报，并可使用 Tavily 补充行业资料。
-- 外部资料生成 Evidence ID、来源链接、摘要和检索时间，统筹模型只能引用已登记证据。
-- API Key 使用 Windows DPAPI（当前用户作用域）加密；界面和协议只返回“是否已配置”。
-- 可选 OpenAI-compatible 统筹模型；未配置时自动使用可测试的本地回退能力。
+- Electron + React three-pane desktop UI with an original "ink-study" research-room design.
+- Python JSONL sidecar with versioned IPC.
+- Deterministic parsing of raw PTrade text, with a confirmation preview.
+- 5 default agents: coordinator, quant signal, company & industry, global markets, risk.
+- Expert selection driven by the report's capabilities, not a fixed all-agents poll.
+- The coordinator reviews expert output after parallel execution; on contradictions, material findings or evidence gaps it can re-invoke existing sub-agents with specific follow-up questions.
+- All autonomous follow-ups are bounded by the existing agent allowlist, duplicate-task filtering and `max_rounds`; the model cannot invent new roles.
+- The risk agent checks for potential negatives per ticker before the report date; the coordinator reviews again before the final synthesis.
+- Pause, cancel, and node-boundary interruption protocol.
+- SQLite persistence for reports, runs and ordered events.
+- In-app run history: inspect past runs with timing/evidence/risk/model-call metrics, one-click rerun, Markdown export.
+- In-app agent management: toggle optional agents, per-project extra requirements, config versioning; core governance roles cannot be disabled.
+- In-app prompt workbench: view full system prompts, save drafts, publish, browse history, roll back; platform safety policies are read-only.
+- Every run records the actual agent config, prompt versions and sub-workflow versions it used.
+- Quant-signal demo sub-workflow: stable security IDs and name history, deterministic PTrade rules, per-run signal observations and stability statistics.
+- Global-markets demo sub-workflow: anchored on the A-share report date — US indices take the latest trading day strictly before it, Korea and Japan take the latest trading day no later than it — with normalized moves and a five-day line chart. Yahoo Finance is the primary source; when it is unreachable the client automatically switches to mirror sources (Tencent for US indices, Eastmoney for Korea and Japan, Sina as a further Nikkei backup) and clearly labels the data as delayed quotes.
+- Agent lifecycle and model-usage events: phase timing, evidence, risk, token, failure and fallback metrics.
+- In-app "Connections & keys" settings hub: model, Tushare and Tavily can each be saved and connection-tested.
+- The company & industry agent integrates Tushare, CNINFO announcements, Eastmoney news & research reports, plus optional Tavily for recent industry background.
+- External material produces Evidence IDs, source links, summaries and retrieval times; the coordinator may only cite registered evidence.
+- API keys are encrypted with Windows DPAPI (current-user scope); the UI and protocol only ever return "configured or not".
+- Optional OpenAI-compatible coordinator model; without one, a testable local fallback keeps the product usable.
+- Portable Windows build: the Python harness is frozen with PyInstaller and bundled by electron-builder into a folder that runs on a clean Windows machine with no Node/Python installed.
 
-## 快速开始
+## Quick start
 
-环境要求：Windows、Python 3.11+、Node.js 22+。
+Requirements: Windows, Python 3.11+, Node.js 22+.
 
 ```powershell
 cd E:\quant-agent
@@ -39,9 +40,21 @@ npm.cmd run build
 npm.cmd run dev
 ```
 
-首次安装时 `setup:electron` 会下载 Electron Windows 运行时。日常开发不需要重复运行。
+`setup:electron` downloads the Electron Windows runtime on first install; it is not needed for daily development.
 
-## 测试
+## Portable build (zero-install)
+
+To produce a portable folder that runs on a clean Windows machine without Node or Python:
+
+```powershell
+npm.cmd run package:win
+```
+
+Build flow: PyInstaller freezes the Python harness into `quant-agent-harness.exe` → it is copied into `apps/desktop/resources/harness/` → electron-builder packages it into the portable folder `apps/desktop/release/win-unpacked/` (with a `使用说明.txt` usage note) and produces the `artifacts/aquant-portable-win-x64.zip` distribution.
+
+Notes: the build machine needs PyInstaller (`python -m pip install pyinstaller`). The Electron runtime zip is downloaded from the npmmirror mirror and cached under `%LOCALAPPDATA%\electron\Cache` to avoid depending on GitHub connectivity.
+
+## Tests
 
 ```powershell
 npm.cmd run test:python
@@ -50,57 +63,67 @@ npm.cmd run build
 npm.cmd audit --audit-level=high
 ```
 
-## 应用内配置
+## In-app configuration
 
-启动桌面应用后，点击右上角“连接与密钥”。所有运行配置都从该界面完成，不需要设置环境变量或另开命令行：
+After starting the desktop app, open "Connections & keys" in the top right. Everything is configured there — no environment variables or extra terminals:
 
-- 统筹模型：填写 OpenAI-compatible Base URL、模型名和 API Key。
-- Tushare：填写 token，供公司与行业 Agent 查询股票身份、行业、公司信息、估值、财务指标和业绩预告。
-- Tavily：填写 API Key，供公司与行业 Agent 补充近期行业资料。
-- 每项均可“保存并测试”；修改保存后无需重启 Harness。
+- Coordinator model: OpenAI-compatible Base URL, model name and API key.
+- Tushare: token used by the company & industry agent for security identity, industry, company info, valuation, financials and performance forecasts.
+- Tavily: API key used by the company & industry agent for recent industry background.
+- Every entry can be "Save & test"; changes apply without restarting the harness.
 
-配置完成后：
+Once configured:
 
-- 统筹模型会从当前报告允许的能力集合中选择需要运行的专家。
-- 模型输出必须通过结构化校验；失败会自动回退到本地能力规则。
-- 量化事实仍由确定性代码计算，模型不能覆盖解析结果。
-- Tushare 与 Tavily 已作为只读工具开放给公司与行业 Agent；外围市场 Agent 当前通过隔离的数据适配器读取公开延迟指数行情。查询失败或权限不足时会逐项标为未知，不会补写事实。
+- The coordinator picks the experts it needs from the capability set the current report allows.
+- Model output must pass structured validation; on failure it automatically falls back to local capability rules.
+- Quant facts are still computed by deterministic code; the model cannot override parsing results.
+- Tushare and Tavily are exposed to the company & industry agent as read-only tools; the global-markets agent reads delayed public index quotes through an isolated data adapter. Failed or denied queries are marked unknown item by item, never fabricated.
 
-## 本地向量知识库
+## Local vector knowledge base
 
-向量库可以完全放在本机，材料处理也不需要逐份手动 embedding。当前代码保留了自动资料入库 demo，后续主要供公司与行业资料库使用：
-
-```text
-实时检索结果 → 内容哈希去重 → 自动切块 → 本地向量化 → SQLite 保存 → 下次运行混合检索
-```
-
-当前 demo 使用零额外依赖的 `local-hashing-v1` 特征向量，目的是先验证采集、去重、索引、召回和审计架构；它不是生产级语义模型。后续可以保持相同接口，切换为本机 Ollama embedding 或 SentenceTransformers，并在数据量增大时把向量存储切换到 Qdrant/pgvector。用户只需要在应用内选择允许的数据源、更新频率和模型；建议人工维护的是“可信来源白名单”和小型评测集，而不是手工生成每一条向量。
-
-## 安全边界
-
-- 首版只读取用户粘贴的报告，不连接旧服务器、邮箱或交易接口。
-- Renderer 没有 Node 权限，只能通过 context-isolated preload 调用白名单 IPC。
-- Renderer 启用 sandbox 与 CSP；IPC 校验发送方，权限请求默认拒绝，外链只允许无凭据 HTTPS。
-- Python Harness 不向 Agent 开放 shell、文件写入、任意 Python 或下单工具。
-- 密钥由 Windows DPAPI 当前用户密钥加密后保存；不会回显到界面、聊天记录或运行事件。
-- 隐藏思维链不保存；只保存结论、结构化详情、任务、状态和错误。
-- 输出仅用于研究解读和风险提示，不构成买卖或仓位建议。
-
-## 目录
+The vector store can live entirely on this machine, and ingestion does not require manual per-document embedding. The code currently ships an automatic ingestion demo, intended mainly for the company & industry material library:
 
 ```text
-apps/desktop/                 Electron 主进程、preload、React UI
-services/harness/src/         Python 解析器、Harness、模型适配和持久化
-services/harness/tests/       Python 单元与动态编排测试
-packages/protocol/            跨进程协议说明和后续生成类型入口
-docs/ARCHITECTURE.md          详细架构与演进边界
-docs/ENTERPRISE_ROADMAP.md    企业级差距、生产化路线与简历表述
+live retrieval results → content-hash dedup → auto chunking → local vectorization → SQLite storage → hybrid retrieval on later runs
 ```
 
-## 下一里程碑
+The current demo uses the zero-dependency `local-hashing-v1` feature vectors to validate the ingestion, dedup, indexing, recall and audit architecture first; it is not a production-grade semantic model. The same interface can later be swapped for a local Ollama embedding or SentenceTransformers, and the vector store moved to Qdrant/pgvector as the data grows. Users only choose allowed sources, refresh frequency and the model in-app; the recommended human-maintained inputs are a trusted-source allowlist and a small evaluation set, not hand-built vectors.
 
-1. LangGraph/PostgreSQL checkpoint、幂等工具调用与进程崩溃续跑。
-2. OpenTelemetry trace/metric/log 导出与质量、成本告警。
-3. 离线评测集、Prompt/模型版本对比和 CI 质量门禁。
-4. 组织级 SSO/RBAC、审批流、Vault/KMS 与多项目隔离。
-5. 签名 Windows 安装包、自动更新、SBOM 和供应链安全扫描。
+## Security boundaries
+
+- v1 only reads reports the user pastes; no connection to legacy servers, email or trading interfaces.
+- The renderer has no Node access; it only reaches the whitelisted IPC through a context-isolated preload.
+- The renderer runs sandboxed with CSP; IPC validates senders, permission requests default to deny, and external links only open credential-free HTTPS.
+- The Python harness exposes no shell, file write, arbitrary Python or order-placement tools to agents.
+- Keys are encrypted with Windows DPAPI at current-user scope and are never echoed into the UI, chat records or run events.
+- Hidden chains of thought are not persisted; only conclusions, structured details, tasks, status and errors are stored.
+- Output is research interpretation and risk flags only — not buy/sell or position advice.
+
+## Repository layout
+
+```text
+apps/desktop/                 Electron main process, preload, React UI
+services/harness/src/         Python parser, harness, model adapters, persistence
+services/harness/tests/       Python unit and dynamic orchestration tests
+packages/protocol/            cross-process protocol notes and future generated types
+docs/ARCHITECTURE.md          detailed architecture and evolution boundaries
+docs/ENTERPRISE_ROADMAP.md    enterprise gaps, production roadmap and resume framing
+```
+
+## Product documentation
+
+The PM-side artifacts of this project (in Chinese) live under `docs/` and in the repo root:
+
+- `docs/PRD.md` — product requirements document v0.2, revised after the first user interview (4 hypotheses tested, 3 overturned), adding interview-driven requirements: decision cards, watchlist, batch processing, effectiveness reporting.
+- `docs/COMPETITIVE_ANALYSIS.md` — six competitor categories (Eastmoney, 同花顺问财, Wind/iFinD, 慧博, general LLMs, the PTrade ecosystem) and the revised differentiation: report-level end-to-end automation + deterministic rule computation + data-source neutrality + human-in-the-loop boundaries.
+- `docs/LAUNCH_PLAN.md` — seed-user plan, phase-2 interview plan, 4–8 week validation cadence and Go/No-Go criteria.
+- `docs/INTERVIEW_GUIDE.md` — the two-phase interview guide.
+- `量化研究员深度访谈记录.md` — full transcript of the 28-minute first interview (anonymized).
+
+## Next milestones
+
+1. LangGraph/PostgreSQL checkpoints, idempotent tool calls, and crash recovery.
+2. OpenTelemetry trace/metric/log export with quality and cost alerts.
+3. Offline evaluation set, prompt/model version comparison, and CI quality gates.
+4. Organization-level SSO/RBAC, approval flows, Vault/KMS and multi-project isolation.
+5. Signed Windows installers, auto-update, SBOM and supply-chain security scanning.
