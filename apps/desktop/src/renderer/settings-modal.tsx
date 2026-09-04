@@ -9,7 +9,15 @@ export interface SettingsData {
   };
   tushare: { token_configured: boolean };
   tavily: { api_key_configured: boolean };
-  storage: { database: string; secret_backend: string };
+  mail: {
+    address: string;
+    imap_host: string;
+    mailbox: string;
+    subject_keywords: string;
+    from_allowlist: string;
+    auth_code_configured: boolean;
+  };
+  storage: { database: string; secret_backend: string; writable: boolean };
 }
 
 interface SettingsModalProps {
@@ -54,6 +62,11 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
 
   if (!open) return null;
 
+  // 服务端模式下连接与密钥由服务器统一配置：输入禁用、只读展示，
+  // "测试连接" 仍可用（测的是服务端已有的配置）。
+  const writable = settings?.storage.writable !== false;
+  const secretPlaceholder = writable ? "" : "由服务端配置";
+
   async function persist(showNotice = true): Promise<SettingsData> {
     const result = await window.quantAgent.request("save_settings", {
       model: { base_url: baseUrl, model: modelName, api_key: modelKey },
@@ -71,6 +84,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
   }
 
   async function save() {
+    if (!settings?.storage.writable) return;
     setBusy("save");
     setNotice(null);
     try {
@@ -86,7 +100,8 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
     setBusy(`test-${target}`);
     setNotice(null);
     try {
-      await persist(false);
+      // 只读模式下没有要保存的改动，跳过 persist 直接测服务端已有配置。
+      if (settings?.storage.writable) await persist(false);
       const result = await window.quantAgent.request("test_integration", { target });
       setNotice({ type: "ok", text: String(result.message || `${target} 连接成功`) });
     } catch (reason) {
@@ -122,7 +137,11 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
           <div>
             <div className="eyebrow">Application Settings</div>
             <h2>连接与密钥</h2>
-            <p>所有必需配置都在这里完成。密钥使用 Windows DPAPI 加密，应用不会显示已保存的明文。</p>
+            <p>
+              {writable
+                ? "所有必需配置都在这里完成。密钥使用 Windows DPAPI 加密，应用不会显示已保存的明文。"
+                : "本演示环境的连接由服务器统一配置，这里只读展示；密钥从不离开服务器。"}
+            </p>
           </div>
           <button className="modal-close" onClick={onClose} aria-label="关闭">×</button>
         </header>
@@ -135,16 +154,16 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
               <Status configured={Boolean(settings?.model.ready)} readyText="可以运行" configuredText="尚未完整配置" />
             </div>
             <div className="form-grid">
-              <label className="wide"><span>Base URL</span><input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" /></label>
-              <label><span>模型名</span><input value={modelName} onChange={(event) => setModelName(event.target.value)} placeholder="例如 gpt-5-mini" /></label>
+              <label className="wide"><span>Base URL</span><input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={secretPlaceholder || "https://api.example.com/v1"} disabled={!writable} /></label>
+              <label><span>模型名</span><input value={modelName} onChange={(event) => setModelName(event.target.value)} placeholder={secretPlaceholder || "例如 gpt-5-mini"} disabled={!writable} /></label>
               <label>
                 <span>API Key <SecretState configured={Boolean(settings?.model.api_key_configured)} /></span>
-                <input type="password" autoComplete="new-password" value={modelKey} onChange={(event) => setModelKey(event.target.value)} placeholder={settings?.model.api_key_configured ? "已保存；留空表示不修改" : "输入 API Key"} />
+                <input type="password" autoComplete="new-password" value={modelKey} onChange={(event) => setModelKey(event.target.value)} placeholder={secretPlaceholder || (settings?.model.api_key_configured ? "已保存；留空表示不修改" : "输入 API Key")} disabled={!writable} />
               </label>
             </div>
             <div className="integration-actions">
-              {settings?.model.api_key_configured && <button className="text-danger" disabled={Boolean(busy)} onClick={() => clearSecret("model")}>清除密钥</button>}
-              <button className="ghost" disabled={Boolean(busy)} onClick={() => test("model")}>{busy === "test-model" ? "测试中…" : "保存并测试模型"}</button>
+              {settings?.model.api_key_configured && <button className="text-danger" disabled={Boolean(busy) || !writable} onClick={() => clearSecret("model")}>清除密钥</button>}
+              <button className="ghost" disabled={Boolean(busy)} onClick={() => test("model")}>{busy === "test-model" ? "测试中…" : writable ? "保存并测试模型" : "测试服务端连接"}</button>
             </div>
           </section>
 
@@ -155,11 +174,11 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
               <Status configured={Boolean(settings?.tushare.token_configured)} />
             </div>
             <div className="form-grid one-column">
-              <label><span>Token <SecretState configured={Boolean(settings?.tushare.token_configured)} /></span><input type="password" autoComplete="new-password" value={tushareToken} onChange={(event) => setTushareToken(event.target.value)} placeholder={settings?.tushare.token_configured ? "已保存；留空表示不修改" : "输入 Tushare token"} /></label>
+              <label><span>Token <SecretState configured={Boolean(settings?.tushare.token_configured)} /></span><input type="password" autoComplete="new-password" value={tushareToken} onChange={(event) => setTushareToken(event.target.value)} placeholder={secretPlaceholder || (settings?.tushare.token_configured ? "已保存；留空表示不修改" : "输入 Tushare token")} disabled={!writable} /></label>
             </div>
             <div className="integration-actions">
-              {settings?.tushare.token_configured && <button className="text-danger" disabled={Boolean(busy)} onClick={() => clearSecret("tushare")}>清除 token</button>}
-              <button className="ghost" disabled={Boolean(busy)} onClick={() => test("tushare")}>{busy === "test-tushare" ? "测试中…" : "保存并测试 Tushare"}</button>
+              {settings?.tushare.token_configured && <button className="text-danger" disabled={Boolean(busy) || !writable} onClick={() => clearSecret("tushare")}>清除 token</button>}
+              <button className="ghost" disabled={Boolean(busy)} onClick={() => test("tushare")}>{busy === "test-tushare" ? "测试中…" : writable ? "保存并测试 Tushare" : "测试服务端连接"}</button>
             </div>
           </section>
 
@@ -170,24 +189,24 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
               <Status configured={Boolean(settings?.tavily.api_key_configured)} />
             </div>
             <div className="form-grid one-column">
-              <label><span>API Key <SecretState configured={Boolean(settings?.tavily.api_key_configured)} /></span><input type="password" autoComplete="new-password" value={tavilyKey} onChange={(event) => setTavilyKey(event.target.value)} placeholder={settings?.tavily.api_key_configured ? "已保存；留空表示不修改" : "输入 Tavily API Key"} /></label>
+              <label><span>API Key <SecretState configured={Boolean(settings?.tavily.api_key_configured)} /></span><input type="password" autoComplete="new-password" value={tavilyKey} onChange={(event) => setTavilyKey(event.target.value)} placeholder={secretPlaceholder || (settings?.tavily.api_key_configured ? "已保存；留空表示不修改" : "输入 Tavily API Key")} disabled={!writable} /></label>
             </div>
             <div className="integration-actions">
-              {settings?.tavily.api_key_configured && <button className="text-danger" disabled={Boolean(busy)} onClick={() => clearSecret("tavily")}>清除密钥</button>}
-              <button className="ghost" disabled={Boolean(busy)} onClick={() => test("tavily")}>{busy === "test-tavily" ? "测试中…" : "保存并测试 Tavily"}</button>
+              {settings?.tavily.api_key_configured && <button className="text-danger" disabled={Boolean(busy) || !writable} onClick={() => clearSecret("tavily")}>清除密钥</button>}
+              <button className="ghost" disabled={Boolean(busy)} onClick={() => test("tavily")}>{busy === "test-tavily" ? "测试中…" : writable ? "保存并测试 Tavily" : "测试服务端连接"}</button>
             </div>
           </section>
 
           <section className="storage-note">
             <div>🔒</div>
-            <div><b>{settings?.storage.secret_backend || "Windows DPAPI"}</b><p>普通设置：{settings?.storage.database || "本地应用数据库"}</p></div>
+            <div><b>{settings?.storage.secret_backend || "Windows DPAPI"}</b><p>{writable ? `普通设置：${settings?.storage.database || "本地应用数据库"}` : "密钥与连接由服务器托管，应用内不可修改"}</p></div>
           </section>
         </div>
 
         <footer className="settings-footer">
           <div>{notice && <span className={`settings-notice ${notice.type}`}>{notice.text}</span>}</div>
           <button className="ghost" onClick={onClose}>关闭</button>
-          <button className="primary" disabled={Boolean(busy)} onClick={save}>{busy === "save" ? "正在保存…" : "保存全部配置"}</button>
+          <button className="primary" disabled={Boolean(busy) || !writable} onClick={save}>{busy === "save" ? "正在保存…" : "保存全部配置"}</button>
         </footer>
       </div>
     </div>

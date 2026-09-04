@@ -4,6 +4,7 @@ import type { HarnessEvent } from "../shared/protocol.js";
 
 const ALLOWED_METHODS = new Set([
   "ping", "get_settings", "save_settings", "test_integration", "parse_report", "list_reports",
+  "get_report", "sync_mailbox",
   "list_runs", "get_agents", "save_agent_config", "start_run", "retry_run", "get_run_snapshot",
   "get_prompt_workspace", "create_prompt_draft", "publish_prompt_version", "rollback_prompt_version",
   "get_workflows",

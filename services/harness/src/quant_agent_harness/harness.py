@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import json
 import re
+import statistics
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,22 +12,42 @@ from decimal import Decimal
 from typing import Callable
 from uuid import uuid4
 
-from .integrations import TavilyClient, TushareClient
-from .models import AgentContribution, AgentTask, Claim, EvidenceItem, HarnessEvent, ParsedReport, ReportStock, RunPolicy
+from .integrations import TavilyClient, TushareClient, normalize_ts_code
+from .models import (
+    DEFAULT_AGENT_PROFILES,
+    AgentContribution,
+    AgentTask,
+    Claim,
+    EvidenceItem,
+    HarnessEvent,
+    LaneSummary,
+    ParsedReport,
+    ReportStock,
+    ResearchState,
+    RunPolicy,
+    TriggerRecord,
+)
 from .llm import OpenAICompatibleClient
+from .parser import tiered_flow_threshold_wanyuan
 from .repository import Repository
 from .public_sources import PublicAStockClient
 from .global_markets import GlobalMarketClient
 from .agent_prompts import (
     AGENT_PROMPT_IDS,
     AGENT_PROMPTS,
-    COORDINATOR_PLANNING_PROMPT,
-    COORDINATOR_REVIEW_PROMPT,
+    BRAIN_PLANNING_PROMPT,
+    BRAIN_REVIEW_PROMPT,
+    BRAIN_SYNTHESIS_PROMPT,
     RISK_PROMPT,
     PLATFORM_POLICY_PROMPT,
-    SYNTHESIS_PROMPT,
 )
 from .workflows import WORKFLOW_DEFINITIONS, workflow_definition
+from .event_rules import (
+    EVENT_SECTOR_MOVE_THRESHOLD_PCT,
+    SECTOR_TRANSMISSION_MAP,
+    EventRuleEngine,
+    RuleContext,
+)
 
 
 EventSink = Callable[[HarnessEvent], None]
@@ -37,6 +58,25 @@ RISK_KEYWORDS = (
     "风险警示", "违约", "逾期", "停产", "事故", "召回", "减值", "业绩下降", "净利润下降",
     "破产", "重整", "失信", "辞职", "失联",
 )
+
+# 常驻泳道：由能力规则兜底；事件泳道可由代码扳机或大脑点名触发，每 run 每 Agent ≤1 次。
+_RESIDENT_LANES = ("quantitative", "fundamental", "global_market", "review")
+_EVENT_AGENT_IDS = {"capital_trace", "bearish_analysis", "global_sector_flow", "sector_transmission"}
+
+_PROFILE_BY_ID = {profile.agent_id: profile for profile in DEFAULT_AGENT_PROFILES}
+_PROFILE_LANE = {profile.agent_id: profile.lane for profile in DEFAULT_AGENT_PROFILES}
+_RESIDENT_LANE_AGENTS = {
+    profile.lane: profile.agent_id
+    for profile in DEFAULT_AGENT_PROFILES
+    if profile.lane in _RESIDENT_LANES
+}
+
+_CAPITAL_CLASSIFICATION_LABELS = {
+    "single_day_pulse": "单日脉冲：当日资金异动缺乏历史延续，可能是短期情绪或事件驱动",
+    "persistent_inflow": "持续流入：近 5 日中至少 3 日主力净流入为正，资金行为有延续性",
+    "persistent_outflow": "持续流出：近 5 日中至少 3 日主力净流出为正，注意资金持续撤出",
+    "insufficient_data": "资金历史数据不足，本轮无法判断持续性",
+}
 
 
 class CapabilityRegistry:
@@ -98,14 +138,22 @@ class Harness:
         self._seq: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def start(self, report_id: str, policy: RunPolicy | None = None) -> str:
+    def start(
+        self,
+        report_id: str,
+        policy: RunPolicy | None = None,
+        *,
+        owner_session: str | None = None,
+    ) -> str:
         report = self.repository.get_report(report_id)
         if report is None:
             raise ValueError(f"找不到报告: {report_id}")
         if report.parse_status == "invalid":
             raise ValueError("解析状态为 invalid，不能启动 Agent 分析")
         run_id = str(uuid4())
-        self.repository.create_run(run_id, report_id)
+        # owner_session 只在 Web 多用户模式下有值；桌面版传 None，
+        # 查询时不过滤，行为与加这一列之前完全一致。
+        self.repository.create_run(run_id, report_id, owner_session=owner_session)
         self._controls[run_id] = RunControl()
         self._seq[run_id] = 0
         thread = threading.Thread(
@@ -137,10 +185,19 @@ class Harness:
         self._control(run_id).add_steering(message.strip())
         self._emit(run_id, "user.steering_queued", payload={"content": message.strip()})
 
+    def active_run_count(self) -> int:
+        """还在跑的运行数。Web 模式据此限制并发——服务器只有 2 核 2G。"""
+        return sum(1 for thread in self._threads.values() if thread.is_alive())
+
     def wait(self, run_id: str, timeout: float | None = None) -> None:
         thread = self._threads.get(run_id)
-        if thread:
-            thread.join(timeout)
+        if not thread:
+            return
+        thread.join(timeout)
+        # 静默超时会让调用方拿着被截断的事件列表继续断言，失败现场看起来
+        # 像业务逻辑出错，实际只是没跑完。这里显式报错，指向真正的原因。
+        if thread.is_alive():
+            raise TimeoutError(f"运行 {run_id} 在 {timeout} 秒内未结束")
 
     def _control(self, run_id: str) -> RunControl:
         control = self._controls.get(run_id)
@@ -154,55 +211,45 @@ class Harness:
             self._hydrate_report_security_names(report)
             self.repository.update_run(run_id, "planning")
             self._emit(run_id, "run.status", payload={"status": "planning"})
-            selected_agents, selection_rationale = self._select_agents(run_id, report)
+            brain_plan = self._brain_planning(run_id, report)
+            state = ResearchState(
+                round=0,
+                core_questions=list(brain_plan.get("core_questions") or []),
+                pending_needs=list(brain_plan.get("agent_calls") or []),
+            )
+            self._emit_research_state(run_id, state)
             symbols = [row.symbol for row in report.stocks[: policy.max_external_symbols]]
-            selected_names = {
-                "quant_signal": "量化",
-                "company_industry": "公司行业",
-                "global_market": "外围市场",
-            }
-            team_text = "、".join(selected_names.get(agent_id, agent_id) for agent_id in selected_agents)
+            resident_tasks, event_tasks, selected_agents, selection_rationale = (
+                self._neck_dispatch_initial(run_id, report, state.pending_needs, policy)
+            )
+            state.needs_history = list(state.pending_needs)
+            state.pending_needs = []
+            self._emit_research_state(run_id, state)
+            team_text = "、".join(_agent_display_name(agent_id) for agent_id in selected_agents)
+            strategy_text = str(brain_plan.get("research_strategy") or "").strip()
             self._emit(
                 run_id,
                 "agent.message",
                 agent_id="coordinator",
                 payload={
-                    "content": f"我已看完报告。先由{team_text} Agent 分头分析，再由风险 Agent 逐票检索近期利空消息，最后由我综合。",
+                    "content": (
+                        f"大脑的研究策略：{strategy_text}\n\n"
+                        f"我作为秘书按泳道安排 {team_text} Agent 分头分析"
+                        + (f"，并在常规分析后派发大脑点名的 {len(event_tasks)} 项专项调查" if event_tasks else "")
+                        + "，之后由风险 Agent 逐票检索近期利空消息，最后由大脑综合。"
+                    ),
                     "selected_agents": selected_agents,
                     "symbols": symbols,
                     "selection_rationale": selection_rationale,
+                    "core_questions": state.core_questions,
+                    "research_strategy": strategy_text,
+                    "brain_agent_calls": [dict(call) for call in state.needs_history],
                     "engine": "openai-compatible" if self.llm_client else "deterministic-demo",
                 },
             )
             agent_configs = {
                 item["agent_id"]: item for item in self.repository.list_agent_configs()
             }
-            workflow_configs = {
-                agent_id: workflow_definition(agent_id) for agent_id in selected_agents
-            }
-            tasks = [
-                AgentTask(
-                    run_id=run_id,
-                    agent_id=agent_id,
-                    title=self._task_title(agent_id),
-                    instructions=(
-                        "基于当前报告完成职责范围内的分析；不得补全缺失事实。"
-                        + (
-                            "\n本项目附加要求：" + self.repository.agent_custom_instructions(agent_id)
-                            if self.repository.agent_custom_instructions(agent_id)
-                            else ""
-                        )
-                    ),
-                    symbols=symbols,
-                    config_version=int((agent_configs.get(agent_id) or {}).get("config_version") or 1),
-                    prompt_version=self._prompt(
-                        AGENT_PROMPT_IDS[agent_id], AGENT_PROMPTS[agent_id]
-                    )[1],
-                    workflow_id=str(workflow_configs[agent_id]["workflow_id"]),
-                    workflow_version=int(workflow_configs[agent_id]["version"]),
-                )
-                for agent_id in selected_agents
-            ]
             review_task = AgentTask(
                 run_id=run_id,
                 agent_id="risk",
@@ -216,21 +263,21 @@ class Harness:
             )
             synthesis_task = AgentTask(
                 run_id=run_id,
-                agent_id="coordinator",
-                title="吸收复核意见并形成最终综合",
-                instructions="区分事实、解释、风险和证据缺口，输出研究解读而非交易建议。",
+                agent_id="brain",
+                title="吸收全部泳道与风险结果并形成最终综合",
+                instructions="区分事实、解释、风险和证据缺口，输出研究解读与跨域定性，而非交易建议。",
                 symbols=symbols,
-                config_version=int((agent_configs.get("coordinator") or {}).get("config_version") or 1),
-                prompt_version=self._prompt("coordinator.synthesis", SYNTHESIS_PROMPT)[1],
+                config_version=int((agent_configs.get("brain") or {}).get("config_version") or 1),
+                prompt_version=self._prompt(AGENT_PROMPT_IDS["brain"], BRAIN_SYNTHESIS_PROMPT)[1],
             )
             self._emit(
                 run_id,
                 "task.plan",
                 agent_id="coordinator",
                 payload={
-                    "tasks": [task.model_dump(mode="json") for task in tasks],
+                    "tasks": [task.model_dump(mode="json") for task in resident_tasks],
                     "workflow_steps": [
-                        *[task.model_dump(mode="json") for task in tasks],
+                        *[task.model_dump(mode="json") for task in resident_tasks],
                         review_task.model_dump(mode="json"),
                         synthesis_task.model_dump(mode="json"),
                     ],
@@ -240,8 +287,11 @@ class Harness:
             self._emit(run_id, "run.status", payload={"status": "specialists_running"})
 
             contributions: list[AgentContribution] = []
-            with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as executor:
-                futures = {executor.submit(self._execute_task, task, report, control): task for task in tasks}
+            with ThreadPoolExecutor(max_workers=max(1, len(resident_tasks))) as executor:
+                futures = {
+                    executor.submit(self._execute_task, task, report, control): task
+                    for task in resident_tasks
+                }
                 for future in as_completed(futures):
                     if control.cancelled.is_set():
                         break
@@ -269,18 +319,37 @@ class Harness:
                     payload={"content": "已在节点边界接收你的补充指令。", "steering": steering},
                 )
 
-            contributions, _unused_review, follow_up_rounds, dispatched_follow_ups = (
-                self._coordinator_follow_up_loop(
+            fired_agents: set[str] = set()
+            fired_scopes: dict[str, set[str]] = {}
+            # checkpoint 1：常驻泳道完成后求值事件规则（资金追查 / 外围板块资金及链式）
+            contributions.extend(
+                self._event_dispatch(
                     run_id,
+                    "specialists_done",
                     report,
                     contributions,
                     None,
                     control,
-                    available_agents=selected_agents,
-                    max_follow_up_rounds=max(0, policy.max_rounds),
-                    phase="specialist_review",
+                    policy,
+                    state,
+                    fired_agents,
+                    fired_scopes,
                 )
             )
+            # 大脑规划阶段点名的专项调查（顺序执行，预算同事件规则；
+            # 已由规则触发过的 Agent 只补查尚未覆盖的标的）
+            if event_tasks:
+                contributions = self._execute_brain_calls(
+                    run_id,
+                    report,
+                    event_tasks,
+                    contributions,
+                    control,
+                    policy,
+                    state,
+                    fired_agents,
+                    fired_scopes,
+                )
 
             self.repository.update_run(run_id, "risk_review")
             self._emit(run_id, "run.status", payload={"status": "risk_review"})
@@ -304,6 +373,7 @@ class Harness:
             )
             self._emit_workflow_plan(review_task)
             review = self._review(run_id, report, contributions, review_task)
+            contributions.append(review)
             self._emit(
                 run_id,
                 "agent.lifecycle",
@@ -322,33 +392,35 @@ class Harness:
                 payload=review.model_dump(mode="json"),
             )
 
-            remaining_rounds = max(0, policy.max_rounds - follow_up_rounds)
-            if remaining_rounds > 0 and review.risks:
-                contributions, reviewed_again, _post_rounds, _dispatched = self._coordinator_follow_up_loop(
+            # checkpoint 2：风险审阅完成后求值事件规则（利空分析）
+            contributions.extend(
+                self._event_dispatch(
                     run_id,
+                    "risk_done",
                     report,
                     contributions,
                     review,
                     control,
-                    available_agents=[*selected_agents, "risk"],
-                    max_follow_up_rounds=remaining_rounds,
-                    phase="post_risk_review",
-                    previous_tasks=dispatched_follow_ups,
+                    policy,
+                    state,
+                    fired_agents,
+                    fired_scopes,
                 )
-                if reviewed_again is not None:
-                    review = reviewed_again
-            else:
-                if review.risks:
-                    self._emit(
-                        run_id,
-                        "agent.message",
-                        agent_id="coordinator",
-                        payload={
-                            "content": "统筹复核：本轮自主补查额度已使用，剩余风险问题作为未知项进入最终综合。",
-                            "stage": "post_risk_review",
-                            "decision": "finish",
-                        },
-                    )
+            )
+
+            # 大脑审阅循环（颈部执行）：压缩状态 → 大脑决策 → 任务书 → 顺序执行
+            contributions, review, state, _rounds_used = self._neck_follow_up_loop(
+                run_id,
+                report,
+                contributions,
+                review,
+                state,
+                control,
+                max_rounds=max(0, policy.max_brain_rounds),
+                policy=policy,
+                fired_agents=fired_agents,
+                fired_scopes=fired_scopes,
+            )
 
             self.repository.update_run(run_id, "synthesizing")
             self._emit(run_id, "run.status", payload={"status": "synthesizing"})
@@ -358,12 +430,14 @@ class Harness:
                     "agent.message",
                     agent_id="coordinator",
                     payload={
-                        "content": "风险 Agent 发现了需要纳入结论的利空线索，我将结合来源和其他分析进行最终综合。",
+                        "content": "风险 Agent 发现了需要纳入结论的利空线索，大脑将结合来源和其他分析进行最终综合。",
                         "stage": "synthesis_handoff",
                         "reviewed_by": "risk",
                     },
                 )
-            final = self._synthesize(run_id, report, contributions, review, steering)
+            final = self._synthesize(
+                run_id, report, contributions, review, steering, state=state
+            )
             self._emit(run_id, "agent.message", agent_id="coordinator", payload=final)
             self.repository.update_run(run_id, "completed", final)
             self._emit(run_id, "run.completed", payload={"status": "completed", "final": final})
@@ -371,107 +445,91 @@ class Harness:
             self.repository.update_run(run_id, "failed", {"error": str(exc)})
             self._emit(run_id, "run.error", payload={"error": f"{type(exc).__name__}: {exc}"})
 
-    def _coordinator_follow_up_loop(
+    def _neck_follow_up_loop(
         self,
         run_id: str,
         report: ParsedReport,
         contributions: list[AgentContribution],
-        review: AgentContribution | None,
+        review: AgentContribution,
+        state: ResearchState,
         control: RunControl,
         *,
-        available_agents: list[str],
-        max_follow_up_rounds: int,
-        phase: str,
-        previous_tasks: set[str] | None = None,
-    ) -> tuple[list[AgentContribution], AgentContribution | None, int, set[str]]:
-        """Let the coordinator review results and re-call only existing agents."""
+        max_rounds: int,
+        policy: RunPolicy,
+        fired_agents: set[str],
+        fired_scopes: dict[str, set[str]],
+    ) -> tuple[list[AgentContribution], AgentContribution, ResearchState, int]:
+        """颈部循环：压缩研究状态 → 大脑审阅决策 → 任务书派发；决策归大脑，执行归颈部。"""
 
-        enabled = self.repository.enabled_agent_ids()
-        allowed = [
-            agent_id
-            for agent_id in dict.fromkeys(available_agents)
-            if agent_id in enabled and agent_id in {"quant_signal", "company_industry", "global_market", "risk"}
-        ]
-        dispatched = set(previous_tasks or set())
+        dispatched: set[str] = set()
         rounds_used = 0
-        while True:
-            remaining = max(0, max_follow_up_rounds - rounds_used)
-            decision = self._coordinator_review_decision(
+        decision: dict = {"decision": "finish", "review_summary": "", "agent_calls": []}
+        while rounds_used < max_rounds:
+            state = self._neck_compress(contributions, review, state, round=rounds_used)
+            self._emit_research_state(run_id, state)
+            decision = self._brain_review(
                 run_id,
                 report,
-                contributions,
-                review,
-                available_agents=allowed,
-                remaining_rounds=remaining,
-                previous_tasks=dispatched,
-                phase=phase,
+                state,
+                remaining_rounds=max_rounds - rounds_used,
+                previous_needs=dispatched,
             )
-            tasks = list(decision.get("tasks") or [])
-            action = str(decision.get("action") or "finish")
-            summary = str(decision.get("review_summary") or "统筹已完成本轮审阅。")
-            if action != "follow_up" or not tasks or remaining <= 0:
+            agent_calls = list(decision.get("agent_calls") or [])
+            if str(decision.get("decision")) != "continue" or not agent_calls:
                 break
-
+            tasks = self._neck_build_follow_up_tasks(
+                run_id, report, agent_calls, policy, fired_agents, fired_scopes
+            )
+            if not tasks:
+                break
+            for task in tasks:
+                state.needs_history.append(
+                    {
+                        "agent_id": task.agent_id,
+                        "question": task.instructions.replace("大脑专项指令：", ""),
+                        "symbols": list(task.symbols),
+                        "reason": "大脑审阅补充",
+                        "priority": 1,
+                    }
+                )
+            summary = str(decision.get("review_summary") or "大脑认为需要补充信息。")
             assignment_text = "；".join(
-                f"{_agent_display_name(str(item['agent_id']))}：{item['instructions']}"
-                for item in tasks
+                f"{_agent_display_name(task.agent_id)}：{task.instructions.replace('大脑专项指令：', '')}"
+                for task in tasks
             )
             self._emit(
                 run_id,
                 "agent.message",
                 agent_id="coordinator",
                 payload={
-                    "content": f"统筹审阅：{summary}\n追加安排：{assignment_text}",
-                    "stage": phase,
-                    "decision": "follow_up",
-                    "tasks": tasks,
+                    "content": f"大脑审阅：{summary}\n追加安排：{assignment_text}",
+                    "stage": "brain_review",
+                    "decision": "continue",
+                    "tasks": [task.model_dump(mode="json") for task in tasks],
                     "round": rounds_used + 1,
                 },
             )
-
-            configs = {item["agent_id"]: item for item in self.repository.list_agent_configs()}
-            follow_up_tasks: list[AgentTask] = []
-            for item in tasks:
-                agent_id = str(item["agent_id"])
-                definition = workflow_definition(agent_id)
-                follow_up_tasks.append(
-                    AgentTask(
-                        run_id=run_id,
-                        agent_id=agent_id,
-                        title="统筹追问 · " + self._task_title(agent_id),
-                        instructions="统筹追问：" + str(item["instructions"]),
-                        symbols=list(item.get("symbols") or []),
-                        config_version=int((configs.get(agent_id) or {}).get("config_version") or 1),
-                        prompt_version=self._prompt(
-                            AGENT_PROMPT_IDS[agent_id],
-                            RISK_PROMPT if agent_id == "risk" else AGENT_PROMPTS[agent_id],
-                        )[1],
-                        workflow_id=str(definition["workflow_id"]),
-                        workflow_version=int(definition["version"]),
-                    )
-                )
             self._emit(
                 run_id,
                 "task.replan",
                 agent_id="coordinator",
                 payload={
-                    "phase": phase,
+                    "phase": "brain_review",
                     "round": rounds_used + 1,
-                    "tasks": [task.model_dump(mode="json") for task in follow_up_tasks],
+                    "tasks": [task.model_dump(mode="json") for task in tasks],
                 },
             )
-
-            for task in follow_up_tasks:
+            for task in tasks:
                 control.wait_if_paused()
                 if control.cancelled.is_set():
-                    return contributions, review, rounds_used, dispatched
+                    return contributions, review, state, rounds_used
                 if task.agent_id == "risk":
                     started = time.perf_counter()
                     self._emit(
                         run_id,
                         "agent.lifecycle",
                         agent_id="risk",
-                        payload={"status": "started", "stage": "coordinator_follow_up"},
+                        payload={"status": "started", "stage": "brain_review"},
                     )
                     self._emit_workflow_plan(task)
                     result = self._review(run_id, report, contributions, task)
@@ -482,7 +540,7 @@ class Harness:
                         agent_id="risk",
                         payload={
                             "status": "completed",
-                            "stage": "coordinator_follow_up",
+                            "stage": "brain_review",
                             "duration_ms": int((time.perf_counter() - started) * 1000),
                             "risk_count": len(result.risks),
                         },
@@ -490,118 +548,688 @@ class Harness:
                 else:
                     result = self._execute_task(task, report, control)
                     contributions.append(result)
+                if task.agent_id in _EVENT_AGENT_IDS:
+                    if task.agent_id in ("global_sector_flow", "sector_transmission"):
+                        fired_scopes[task.agent_id] = {"*"}
+                    else:
+                        fired_scopes[task.agent_id] = (
+                            fired_scopes.get(task.agent_id) or set()
+                        ) | set(task.symbols)
                 self._emit(
                     run_id,
                     "agent.message",
                     agent_id=result.agent_id,
                     payload={
                         **result.model_dump(mode="json"),
-                        "stage": "coordinator_follow_up_result",
-                        "requested_by": "coordinator",
+                        "stage": "brain_review_result",
+                        "requested_by": "brain",
                     },
                 )
             rounds_used += 1
-            if rounds_used >= max_follow_up_rounds:
-                break
-        return contributions, review, rounds_used, dispatched
+        state.terminated_reason = (
+            "budget_exhausted"
+            if str(decision.get("decision")) == "continue" and rounds_used >= max_rounds
+            else "brain_finish"
+        )
+        return contributions, review, state, rounds_used
 
-    def _coordinator_review_decision(
+    def _brain_review(
         self,
         run_id: str,
         report: ParsedReport,
-        contributions: list[AgentContribution],
-        review: AgentContribution | None,
+        state: ResearchState,
         *,
-        available_agents: list[str],
         remaining_rounds: int,
-        previous_tasks: set[str],
-        phase: str,
+        previous_needs: set[str],
     ) -> dict:
         if self.llm_client is None:
             return {
-                "action": "finish",
-                "review_summary": "当前未配置可用模型，统筹无法进行自主追问判断，已按现有结果继续。",
-                "tasks": [],
+                "decision": "finish",
+                "review_summary": "当前未配置可用模型，大脑无法进行自主补充判断，已按现有结果继续。",
+                "agent_calls": [],
             }
-        system = self._prompt("coordinator.review", COORDINATOR_REVIEW_PROMPT)[0]
+        system = self._prompt("brain.review", BRAIN_REVIEW_PROMPT)[0]
+        valid_symbols = {row.symbol for row in report.stocks}
+        available = self._available_callable_agents()
         payload = {
-            "phase": phase,
             "report": {
                 "report_date": report.report_date,
                 "parse_status": report.parse_status,
-                "symbols": [row.symbol for row in report.stocks],
+                "symbols": sorted(valid_symbols),
             },
-            "available_agents": [
-                {"agent_id": agent_id, "responsibility": _agent_responsibility(agent_id)}
-                for agent_id in available_agents
+            "agents": [
+                {
+                    "agent_id": agent_id,
+                    "display_name": _agent_display_name(agent_id),
+                    "responsibility": _agent_responsibility(agent_id),
+                    "description": _PROFILE_BY_ID[agent_id].description,
+                }
+                for agent_id in available
             ],
             "remaining_rounds": remaining_rounds,
-            "previous_tasks": sorted(previous_tasks),
-            "agent_results": [
-                _compact_contribution_for_review(item)
-                for item in _latest_contributions_by_agent(contributions)
-            ],
-            "risk_result": _compact_contribution_for_review(review) if review else None,
+            "research_state": state.model_dump(mode="json"),
         }
         try:
             result = self.llm_client.complete_json(system, json.dumps(payload, ensure_ascii=False, default=str))
-            action = str(result.data.get("action") or "finish").lower()
+            raw_decision = str(result.data.get("decision") or "finish").lower()
             review_summary = str(result.data.get("review_summary") or "").strip()[:1200]
-            valid_symbols = {row.symbol for row in report.stocks}
-            tasks = []
-            if action == "follow_up" and remaining_rounds > 0:
-                for raw in list(result.data.get("tasks") or [])[:1]:
+            agent_calls = []
+            if raw_decision == "continue" and remaining_rounds > 0:
+                for raw in list(result.data.get("agent_calls") or [])[:3]:
                     if not isinstance(raw, dict):
                         continue
                     agent_id = str(raw.get("agent_id") or "")
-                    instructions = str(raw.get("instructions") or "").strip()[:1000]
-                    symbols = [str(item) for item in raw.get("symbols") or [] if str(item) in valid_symbols]
+                    question = str(raw.get("question") or "").strip()[:1000]
+                    symbols = [str(item) for item in raw.get("symbols") or [] if str(item) in valid_symbols][:3]
                     reason = str(raw.get("reason") or "").strip()[:500]
-                    if agent_id not in available_agents or len(instructions) < 8:
+                    priority = int(raw.get("priority") or 2)
+                    if agent_id not in available or len(question) < 8:
                         continue
-                    signature = _follow_up_signature(agent_id, instructions, symbols)
-                    if signature in previous_tasks:
+                    signature = _follow_up_signature(agent_id, question, symbols)
+                    if signature in previous_needs:
                         continue
-                    previous_tasks.add(signature)
-                    tasks.append(
+                    previous_needs.add(signature)
+                    agent_calls.append(
                         {
                             "agent_id": agent_id,
-                            "instructions": instructions,
+                            "question": question,
                             "symbols": symbols,
-                            "reason": reason or "统筹审阅认为该问题会影响最终结论",
+                            "reason": reason or "大脑审阅认为该问题会影响最终结论",
+                            "priority": priority,
                         }
                     )
-            if not tasks:
-                action = "finish"
+            if not agent_calls:
+                raw_decision = "finish"
             self._emit(
                 run_id,
                 "model.usage",
-                agent_id="coordinator",
+                agent_id="brain",
                 payload={
                     "stage": "review",
-                    "phase": phase,
                     "model": result.model,
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
                 },
             )
             return {
-                "action": action,
-                "review_summary": review_summary or "统筹已检查现有结果，未发现必须追加的有效任务。",
-                "tasks": tasks,
+                "decision": raw_decision,
+                "review_summary": review_summary or "大脑已检查研究状态，未发现必须追加的有效信息。",
+                "agent_calls": agent_calls,
             }
         except Exception as exc:
             self._emit(
                 run_id,
                 "model.fallback",
-                agent_id="coordinator",
-                payload={"stage": "review", "phase": phase, "error": f"{type(exc).__name__}: {exc}"},
+                agent_id="brain",
+                payload={"stage": "review", "error": f"{type(exc).__name__}: {exc}"},
             )
             return {
-                "action": "finish",
-                "review_summary": "统筹审阅模型本轮不可用，已保留现有结果并停止追加调用。",
-                "tasks": [],
+                "decision": "finish",
+                "review_summary": "大脑审阅模型本轮不可用，已保留现有结果并停止追加调用。",
+                "agent_calls": [],
             }
+
+    def _neck_build_follow_up_tasks(
+        self,
+        run_id: str,
+        report: ParsedReport,
+        calls: list[dict],
+        policy: RunPolicy,
+        fired_agents: set[str],
+        fired_scopes: dict[str, set[str]],
+    ) -> list[AgentTask]:
+        # 去重已在 _brain_review 完成（签名加入 previous_needs 集合），
+        # 这里做 agent 校验（事件 Agent 按覆盖度与预算）与任务书构造。
+        enabled = self.repository.enabled_agent_ids()
+        configs = {item["agent_id"]: item for item in self.repository.list_agent_configs()}
+        valid_symbols = {row.symbol for row in report.stocks}
+        tasks: list[AgentTask] = []
+        for call in calls[:3]:
+            agent_id = str(call.get("agent_id") or "")
+            question = str(call.get("question") or "").strip()
+            if agent_id not in enabled or not question:
+                continue
+            symbols = [str(item) for item in call.get("symbols") or [] if str(item) in valid_symbols][:3]
+            if agent_id in _EVENT_AGENT_IDS:
+                covered = fired_scopes.get(agent_id, set())
+                if covered == {"*"}:
+                    continue
+                if agent_id in fired_agents:
+                    uncovered = sorted(set(symbols) - covered)
+                    if not uncovered:
+                        continue
+                    symbols = uncovered
+                elif len(fired_agents) >= policy.max_event_agent_calls:
+                    continue
+                fired_agents.add(agent_id)
+            definition = workflow_definition(agent_id)
+            tasks.append(
+                AgentTask(
+                    run_id=run_id,
+                    agent_id=agent_id,
+                    title="大脑追问 · " + self._task_title(agent_id),
+                    instructions="大脑专项指令：" + question,
+                    symbols=symbols,
+                    config_version=int((configs.get(agent_id) or {}).get("config_version") or 1),
+                    prompt_version=self._prompt(
+                        AGENT_PROMPT_IDS[agent_id],
+                        RISK_PROMPT if agent_id == "risk" else AGENT_PROMPTS.get(agent_id, ""),
+                    )[1],
+                    workflow_id=str(definition["workflow_id"]),
+                    workflow_version=int(definition["version"]),
+                )
+            )
+        return tasks
+
+    def _brain_planning(self, run_id: str, report: ParsedReport) -> dict:
+        """大脑初始规划：研究策略 + 核心问题 + 自主点名的专项调查指令。"""
+        fallback = self._default_brain_plan(report)
+        if self.llm_client is None:
+            return fallback
+        system = self._prompt("brain.planning", BRAIN_PLANNING_PROMPT)[0]
+        valid_symbols = {row.symbol for row in report.stocks}
+        formal = [
+            {"symbol": row.symbol, "name": row.name}
+            for row in _formal_recommendation_rows(report)
+        ]
+        anomalies = [
+            {"symbol": row.symbol, "super_large_anomaly": True}
+            for row in report.stocks
+            if row.super_large_anomaly is True
+        ]
+        available = self._available_callable_agents()
+        compact = {
+            "parse_status": report.parse_status,
+            "generated_at": report.generated_at,
+            "selected_count": len(report.selected_rows),
+            "near_count": len(report.near_rows),
+            "symbols": [row.symbol for row in report.stocks],
+            "diagnostics": report.diagnostics,
+            "deterministic_quant": {"formal": formal, "anomalies": anomalies},
+            "agents": [
+                {
+                    "agent_id": agent_id,
+                    "display_name": _agent_display_name(agent_id),
+                    "responsibility": _agent_responsibility(agent_id),
+                    "description": _PROFILE_BY_ID[agent_id].description,
+                }
+                for agent_id in available
+            ],
+        }
+        try:
+            result = self.llm_client.complete_json(system, json.dumps(compact, ensure_ascii=False, default=str))
+            core_questions = [
+                str(question).strip()
+                for question in result.data.get("core_questions") or []
+                if str(question).strip()
+            ][:4]
+            calls = _validated_agent_calls(
+                result.data.get("agent_calls"), available, valid_symbols, limit=3
+            )
+            self._emit(
+                run_id,
+                "model.usage",
+                agent_id="brain",
+                payload={
+                    "stage": "planning",
+                    "model": result.model,
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                },
+            )
+            return {
+                "research_strategy": str(result.data.get("research_strategy") or "").strip()[:600],
+                "core_questions": core_questions or fallback["core_questions"],
+                "agent_calls": calls or fallback["agent_calls"],
+            }
+        except Exception as exc:
+            self._emit(
+                run_id,
+                "model.fallback",
+                agent_id="brain",
+                payload={"stage": "planning", "error": f"{type(exc).__name__}: {exc}"},
+            )
+            return fallback
+
+    def _default_brain_plan(self, report: ParsedReport) -> dict:
+        """无模型或模型不可用时的确定性研究计划：只保留常驻泳道兜底。"""
+        core_questions = [
+            "量化信号是否可靠？",
+            "公司与行业背景如何？",
+            "外围市场环境如何？",
+            "存在哪些潜在利空？",
+        ]
+        return {
+            "research_strategy": "常规研究：由常驻泳道完成量化复核、公司背景、外围市场与风险检索，事件规则会在出现异常信号时自动追加专项调查。",
+            "core_questions": core_questions,
+            "agent_calls": [],
+        }
+
+    def _available_callable_agents(self) -> list[str]:
+        """大脑可点名调查的 Agent：注册、启用、且不是大脑/秘书本人。"""
+        return [
+            profile.agent_id
+            for profile in DEFAULT_AGENT_PROFILES
+            if profile.agent_id not in {"brain", "coordinator"}
+            and profile.agent_id in self.repository.enabled_agent_ids()
+        ]
+
+    def _neck_dispatch_initial(
+        self,
+        run_id: str,
+        report: ParsedReport,
+        calls: list[dict],
+        policy: RunPolicy,
+    ) -> tuple[list[AgentTask], list[AgentTask], list[str], str]:
+        """颈部初始派单：常驻泳道由能力规则兜底；大脑点名的常驻 Agent 需求合并进任务书，专项 Agent 需求另列待顺序执行。"""
+        selected_agents = self.registry.select(report, self.repository)
+        agent_configs = {item["agent_id"]: item for item in self.repository.list_agent_configs()}
+        workflow_configs = {
+            agent_id: workflow_definition(agent_id) for agent_id in selected_agents
+        }
+        symbols = [row.symbol for row in report.stocks[: policy.max_external_symbols]]
+        resident_tasks: list[AgentTask] = []
+        for agent_id in selected_agents:
+            lines = ["基于当前报告完成职责范围内的分析；不得补全缺失事实。"]
+            for call in calls:
+                if call.get("agent_id") == agent_id:
+                    lines.append(
+                        f"大脑专项指令：{call.get('question')}（原因：{call.get('reason')}）"
+                    )
+            custom = self.repository.agent_custom_instructions(agent_id)
+            if custom:
+                lines.append("本项目附加要求：" + custom)
+            resident_tasks.append(
+                AgentTask(
+                    run_id=run_id,
+                    agent_id=agent_id,
+                    title=self._task_title(agent_id),
+                    instructions="\n".join(lines),
+                    symbols=symbols,
+                    config_version=int((agent_configs.get(agent_id) or {}).get("config_version") or 1),
+                    prompt_version=self._prompt(
+                        AGENT_PROMPT_IDS[agent_id], AGENT_PROMPTS[agent_id]
+                    )[1],
+                    workflow_id=str(workflow_configs[agent_id]["workflow_id"]),
+                    workflow_version=int(workflow_configs[agent_id]["version"]),
+                )
+            )
+        event_tasks: list[AgentTask] = [
+            self._brain_call_task(
+                run_id, report, call, agent_configs, policy, title_prefix="大脑规划"
+            )
+            for call in calls
+            if call.get("agent_id") not in selected_agents
+        ]
+        rationale = "常驻泳道由本地能力规则兜底；大脑的专项指令由秘书按序派发。"
+        return resident_tasks, event_tasks, selected_agents, rationale
+
+    def _brain_call_task(
+        self,
+        run_id: str,
+        report: ParsedReport,
+        call: dict,
+        agent_configs: dict,
+        policy: RunPolicy,
+        *,
+        title_prefix: str,
+    ) -> AgentTask:
+        agent_id = str(call.get("agent_id") or "")
+        definition = workflow_definition(agent_id)
+        instructions = (
+            f"大脑专项指令：{call.get('question')}（原因：{call.get('reason')}）。"
+            "职责内完成分析；不得补全缺失事实。"
+        )
+        custom = self.repository.agent_custom_instructions(agent_id)
+        if custom:
+            instructions += "\n本项目附加要求：" + custom
+        return AgentTask(
+            run_id=run_id,
+            agent_id=agent_id,
+            title=title_prefix + " · " + self._task_title(agent_id),
+            instructions=instructions,
+            symbols=[str(item) for item in call.get("symbols") or []][:3],
+            config_version=int((agent_configs.get(agent_id) or {}).get("config_version") or 1),
+            prompt_version=self._prompt(
+                AGENT_PROMPT_IDS[agent_id],
+                RISK_PROMPT if agent_id == "risk" else AGENT_PROMPTS.get(agent_id, ""),
+            )[1],
+            workflow_id=str(definition["workflow_id"]),
+            workflow_version=int(definition["version"]),
+        )
+
+    def _execute_brain_calls(
+        self,
+        run_id: str,
+        report: ParsedReport,
+        tasks: list[AgentTask],
+        contributions: list[AgentContribution],
+        control: RunControl,
+        policy: RunPolicy,
+        state: ResearchState,
+        fired_agents: set[str],
+        fired_scopes: dict[str, set[str]],
+    ) -> list[AgentContribution]:
+        """执行大脑点名的专项调查（顺序执行；预算与每 Agent ≤1 次约束同事件规则。
+
+        若规则已触发过该 Agent，大脑的请求按覆盖度处理：只补查尚未覆盖的标的。
+        """
+        for task in tasks:
+            control.wait_if_paused()
+            if control.cancelled.is_set():
+                return contributions
+            agent_id = task.agent_id
+            covered = fired_scopes.get(agent_id, set())
+            blocked = ""
+            if agent_id in fired_agents and covered == {"*"}:
+                blocked = "该 Agent 已覆盖全市场"
+            elif agent_id in fired_agents:
+                uncovered = sorted(set(task.symbols) - covered)
+                if not uncovered:
+                    blocked = "目标标的已由本轮调查覆盖"
+                else:
+                    task = task.model_copy(update={"symbols": uncovered})
+            elif len(fired_agents) >= policy.max_event_agent_calls:
+                blocked = "事件预算已用尽"
+            elif agent_id not in self.repository.enabled_agent_ids():
+                blocked = "Agent 已停用"
+            if blocked:
+                state.trigger_log.append(
+                    TriggerRecord(
+                        rule_id="brain.call." + agent_id,
+                        agent_id=agent_id,
+                        fired_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                        round=state.round,
+                        condition_summary=f"大脑点名 {_agent_display_name(agent_id)}（未派发：{blocked}）",
+                    )
+                )
+                continue
+            fired_agents.add(agent_id)
+            self._emit(
+                run_id,
+                "task.brain_dispatch",
+                agent_id="coordinator",
+                payload={"tasks": [task.model_dump(mode="json")], "requested_by": "brain"},
+            )
+            self._emit(
+                run_id,
+                "agent.lifecycle",
+                agent_id=agent_id,
+                payload={"status": "started", "stage": "brain_dispatch"},
+            )
+            result = self._execute_task(task, report, control)
+            contributions.append(result)
+            self._emit(
+                run_id,
+                "agent.message",
+                agent_id=result.agent_id,
+                payload={
+                    **result.model_dump(mode="json"),
+                    "stage": "brain_dispatch_result",
+                    "requested_by": "brain",
+                },
+            )
+            if agent_id in ("global_sector_flow", "sector_transmission"):
+                fired_scopes[agent_id] = {"*"}
+            else:
+                fired_scopes[agent_id] = (fired_scopes.get(agent_id) or set()) | set(task.symbols)
+            chain = self._event_dispatch(
+                run_id,
+                f"after_agent:{agent_id}",
+                report,
+                contributions,
+                None,
+                control,
+                policy,
+                state,
+                fired_agents,
+                fired_scopes,
+            )
+            contributions.extend(chain)
+        return contributions
+
+    def _neck_compress(
+        self,
+        contributions: list[AgentContribution],
+        review: AgentContribution,
+        state: ResearchState,
+        *,
+        round: int,
+    ) -> ResearchState:
+        """颈部压缩：把各 Agent 结果收敛为 ResearchState（lanes 整体替换）。"""
+        lanes: list[LaneSummary] = []
+        for contribution in _latest_contributions_by_agent(contributions):
+            claims = [
+                claim.text
+                for claim in contribution.claims
+                if claim.kind in ("fact", "interpretation")
+            ]
+            lanes.append(
+                LaneSummary(
+                    agent_id=contribution.agent_id,
+                    lane=_PROFILE_LANE.get(contribution.agent_id, contribution.agent_id),
+                    headline=str(contribution.summary or "").replace("\n", " ")[:160],
+                    key_findings=[text[:200] for text in claims[:5]],
+                    risks=list(contribution.risks)[:5],
+                    unknowns=list(contribution.unknowns)[:5],
+                    structured=_compact_structured(contribution.structured_data),
+                )
+            )
+        state.round = round
+        state.lanes = lanes
+        return state
+
+    def _emit_research_state(self, run_id: str, state: ResearchState) -> None:
+        self._emit(
+            run_id,
+            "research.state",
+            agent_id="coordinator",
+            payload=state.model_dump(mode="json"),
+        )
+
+    def _event_dispatch(
+        self,
+        run_id: str,
+        checkpoint: str,
+        report: ParsedReport,
+        contributions: list[AgentContribution],
+        review: AgentContribution | None,
+        control: RunControl,
+        policy: RunPolicy,
+        state: ResearchState,
+        fired_agents: set[str],
+        fired_scopes: dict[str, set[str]],
+    ) -> list[AgentContribution]:
+        """事件规则求值与派单：扳机由代码判定，模型只写任务书内容。
+
+        未实现工作流的触发 Agent 只记录不派单（trigger_log.dispatched=False）。
+        """
+        context = self._build_rule_context(report, contributions, review, state)
+        records = EventRuleEngine().evaluate(checkpoint, context)
+        added: list[AgentContribution] = []
+        for record in records:
+            blocked_reason = ""
+            if record.agent_id not in self._task_handlers():
+                blocked_reason = "工作流未实现"
+            elif record.agent_id in fired_agents:
+                blocked_reason = "本轮已派发过"
+            elif len(fired_agents) >= policy.max_event_agent_calls:
+                blocked_reason = "事件预算已用尽"
+            elif record.agent_id not in self.repository.enabled_agent_ids():
+                blocked_reason = "Agent 已停用"
+            if blocked_reason:
+                state.trigger_log.append(
+                    record.model_copy(
+                        update={
+                            "dispatched": False,
+                            "condition_summary": record.condition_summary + f"（未派发：{blocked_reason}）",
+                        }
+                    )
+                )
+                continue
+            state.trigger_log.append(record)
+            self._emit_research_state(run_id, state)
+            fired_agents.add(record.agent_id)
+            fired_scopes[record.agent_id] = (
+                fired_scopes.get(record.agent_id, set()) | _event_scope_for(record, report)
+            )
+            task = self._event_task(run_id, report, record, policy)
+            self._emit(
+                run_id,
+                "task.event_dispatch",
+                agent_id="coordinator",
+                payload={
+                    "rule_id": record.rule_id,
+                    "checkpoint": checkpoint,
+                    "tasks": [task.model_dump(mode="json")],
+                },
+            )
+            self._emit(
+                run_id,
+                "agent.lifecycle",
+                agent_id=task.agent_id,
+                payload={"status": "started", "stage": "event_dispatch"},
+            )
+            result = self._execute_task(task, report, control)
+            added.append(result)
+            self._emit(
+                run_id,
+                "agent.message",
+                agent_id=result.agent_id,
+                payload={
+                    **result.model_dump(mode="json"),
+                    "stage": "event_dispatch_result",
+                    "triggered_by": record.rule_id,
+                },
+            )
+            chain = self._event_dispatch(
+                run_id,
+                f"after_agent:{record.agent_id}",
+                report,
+                [*contributions, *added],
+                review,
+                control,
+                policy,
+                state,
+                fired_agents,
+                fired_scopes,
+            )
+            added.extend(chain)
+        if records:
+            self._emit_research_state(run_id, state)
+        return added
+
+    def _event_task(
+        self,
+        run_id: str,
+        report: ParsedReport,
+        record: TriggerRecord,
+        policy: RunPolicy,
+    ) -> AgentTask:
+        agent_id = record.agent_id
+        agent_configs = {item["agent_id"]: item for item in self.repository.list_agent_configs()}
+        definition = workflow_definition(agent_id)
+        instructions = (
+            f"事件触发（{record.rule_id}）：{record.condition_summary}。"
+            "触发器数据：" + json.dumps(record.inputs, ensure_ascii=False, default=str) + "。"
+            "职责内完成分析；不得补全缺失事实。"
+        )
+        custom = self.repository.agent_custom_instructions(agent_id)
+        if custom:
+            instructions += "\n本项目附加要求：" + custom
+        return AgentTask(
+            run_id=run_id,
+            agent_id=agent_id,
+            title=self._task_title(agent_id) + "（事件触发）",
+            instructions=instructions,
+            symbols=[row.symbol for row in report.stocks[: policy.max_external_symbols]],
+            config_version=int((agent_configs.get(agent_id) or {}).get("config_version") or 1),
+            prompt_version=self._prompt(AGENT_PROMPT_IDS[agent_id], AGENT_PROMPTS[agent_id])[1],
+            workflow_id=str(definition["workflow_id"]),
+            workflow_version=int(definition["version"]),
+        )
+
+    def _build_rule_context(
+        self,
+        report: ParsedReport,
+        contributions: list[AgentContribution],
+        review: AgentContribution | None,
+        state: ResearchState,
+    ) -> RuleContext:
+        rows = []
+        for row in report.stocks:
+            rows.append(
+                {
+                    "symbol": row.symbol,
+                    "super_large_anomaly": row.super_large_anomaly,
+                    "realtime_formula_wanyuan": (
+                        float(row.realtime_formula_wanyuan)
+                        if row.realtime_formula_wanyuan is not None
+                        else None
+                    ),
+                    "effective_threshold": _row_effective_threshold(row),
+                }
+            )
+        global_snapshot: dict = {}
+        for contribution in _latest_contributions_by_agent(contributions):
+            if contribution.agent_id == "global_market":
+                global_snapshot = contribution.structured_data
+        market_indices = tuple(global_snapshot.get("market_indices") or ())
+        market_status = str(global_snapshot.get("status") or "")
+        risk_categories: list[str] = []
+        if review is not None:
+            risk_categories = list(review.structured_data.get("risk_categories") or [])
+            for text in review.risks:
+                category = _risk_category(text)
+                if category != "潜在利空" and category not in risk_categories:
+                    risk_categories.append(category)
+        chained_structured: dict[str, dict] = {}
+        for contribution in _latest_contributions_by_agent(contributions):
+            if contribution.agent_id == "global_sector_flow":
+                chained_structured["global_sector_flow.move"] = contribution.structured_data
+        chained_fired = frozenset(
+            record.rule_id for record in state.trigger_log if record.dispatched
+        )
+        return RuleContext(
+            rows=tuple(rows),
+            market_status=market_status,
+            market_indices=market_indices,
+            risk_categories=tuple(risk_categories),
+            chained_fired=chained_fired,
+            chained_structured=chained_structured,
+            round=state.round,
+        )
+
+    def _task_handlers(self) -> dict[str, Callable[[AgentTask, ParsedReport], AgentContribution]]:
+        """已实现专用工作流的 Agent → 执行器；未登记的工作流走通用确定性执行器。"""
+        return {
+            "quant_signal": self._run_quant_workflow,
+            "company_industry": lambda task, report: self._llm_contribution(
+                task,
+                report,
+                self._company_contribution(report, task.instructions, task.symbols),
+            ),
+            "global_market": self._run_global_market_workflow,
+            "capital_trace": self._run_capital_trace_workflow,
+            "bearish_analysis": self._run_bearish_analysis_workflow,
+            "global_sector_flow": self._run_global_sector_flow_workflow,
+            "sector_transmission": self._run_sector_transmission_workflow,
+        }
+
+    def _generic_contribution(self, task: AgentTask, report: ParsedReport) -> AgentContribution:
+        """未登记专用工作流的 Agent 的确定性兜底：只说明职责边界，不编造事实。"""
+        profile = _PROFILE_BY_ID.get(task.agent_id)
+        description = profile.description if profile else ""
+        return AgentContribution(
+            agent_id=task.agent_id,
+            summary=(
+                f"{_agent_display_name(task.agent_id)}完成职责范围内的确定性分析：{description}"
+                "当前运行未取得可进一步核验的外部数据。"
+            ),
+            unknowns=[
+                f"{_agent_display_name(task.agent_id)}未登记专用数据工作流，无法取得额外证据。"
+            ],
+        )
 
     def _execute_task(self, task: AgentTask, report: ParsedReport, control: RunControl) -> AgentContribution:
         control.wait_if_paused()
@@ -615,18 +1243,15 @@ class Harness:
             payload={"status": "started", "stage": "specialist"},
         )
         try:
-            if task.agent_id == "quant_signal":
-                contribution = self._run_quant_workflow(task, report)
-            elif task.agent_id == "company_industry":
+            handler = self._task_handlers().get(task.agent_id)
+            if handler is not None:
+                contribution = handler(task, report)
+            else:
                 contribution = self._llm_contribution(
                     task,
                     report,
-                    self._company_contribution(report, task.instructions, task.symbols),
+                    self._generic_contribution(task, report),
                 )
-            elif task.agent_id == "global_market":
-                contribution = self._run_global_market_workflow(task, report)
-            else:
-                contribution = AgentContribution(agent_id=task.agent_id, summary="没有可执行的能力")
             self._emit(
                 task.run_id,
                 "agent.lifecycle",
@@ -674,6 +1299,11 @@ class Harness:
             task,
             "signal_rules",
             lambda: self._quant_contribution(report, task.run_id),
+        )
+        self._workflow_step(
+            task,
+            "visual_payload",
+            lambda: deterministic.structured_data.get("flow_structure") or [],
         )
         stability = self._workflow_step(
             task,
@@ -724,6 +1354,380 @@ class Harness:
             task,
             "market_explanation",
             lambda: self._llm_contribution(task, report, contribution),
+        )
+
+    def _run_capital_trace_workflow(self, task: AgentTask, report: ParsedReport) -> AgentContribution:
+        self._emit_workflow_plan(task)
+        inputs = _event_inputs(task)
+        restrict = task.symbols if task.instructions.startswith("大脑专项指令") else None
+        trigger_rows = self._workflow_step(
+            task,
+            "trigger_scope",
+            lambda: _capital_trigger_rows(report, inputs, restrict),
+        )
+        history = self._workflow_step(
+            task,
+            "flow_history",
+            lambda: self._capital_trace_history(trigger_rows, report),
+        )
+        classified = self._workflow_step(
+            task,
+            "pulse_classify",
+            lambda: _classify_capital_pulses(history),
+        )
+        fallback = self._capital_trace_fallback(task, trigger_rows, classified)
+        return self._workflow_step(
+            task,
+            "capital_explanation",
+            lambda: self._llm_contribution(task, report, fallback),
+        )
+
+    def _capital_trace_history(self, entries: list[dict], report: ParsedReport) -> dict:
+        """逐只查询近 10 日资金流历史：Tushare moneyflow 为主，东财个股资金流为备。"""
+        end = _normalized_date(report.report_date) or _normalized_date(report.generated_at)
+        try:
+            end_date = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
+        except ValueError:
+            end_date = datetime.now()
+        start_ymd = (end_date - timedelta(days=14)).strftime("%Y%m%d")
+        end_ymd = end_date.strftime("%Y%m%d")
+        result: dict = {}
+        for entry in entries:
+            symbol = entry["symbol"]
+            rows: list[dict] = []
+            errors: list[str] = []
+            if self.tushare_client is not None:
+                try:
+                    raw = self.tushare_client.query(
+                        "moneyflow",
+                        params={
+                            "ts_code": normalize_ts_code(symbol),
+                            "start_date": start_ymd,
+                            "end_date": end_ymd,
+                        },
+                        fields="ts_code,trade_date,net_mf_amount",
+                    )
+                    rows = [
+                        {"date": str(item.get("trade_date") or ""), "net": float(item.get("net_mf_amount") or 0)}
+                        for item in raw
+                        if item.get("trade_date")
+                    ]
+                except Exception as exc:
+                    errors.append("Tushare 资金流：" + _external_error(exc))
+            if not rows and self.public_a_stock_client is not None:
+                try:
+                    code = symbol.split(".", 1)[0]
+                    daily = self.public_a_stock_client.stock_fund_flow_history(code, days=10)
+                    rows = [
+                        {"date": str(item.get("date") or ""), "net": float(item.get("main_net") or 0)}
+                        for item in daily
+                        if item.get("date") and str(item["date"]) <= end
+                    ]
+                except Exception as exc:
+                    errors.append("东财资金流：" + _external_error(exc))
+            rows.sort(key=lambda item: str(item["date"]))
+            result[symbol] = {"rows": rows[-10:], "errors": errors, "trigger": entry}
+        return result
+
+    def _capital_trace_fallback(
+        self,
+        task: AgentTask,
+        trigger_rows: list[dict],
+        classified: dict,
+    ) -> AgentContribution:
+        labels = {
+            "single_day_pulse": "单日脉冲：当日异动缺乏历史延续",
+            "persistent_inflow": "持续流入：最近 5 日中至少 3 日主力净流入为正",
+            "persistent_outflow": "持续流出：最近 5 日中至少 3 日主力净流出为正",
+            "insufficient_data": "资金历史数据不足，无法判断持续性",
+        }
+        lines: list[str] = []
+        unknowns: list[str] = []
+        evidence: list[EvidenceItem] = []
+        per_symbol: list[dict] = []
+        for entry in trigger_rows:
+            symbol = entry["symbol"]
+            item = classified.get(symbol) or {}
+            rows = item.get("rows") or []
+            label = labels.get(str(item.get("classification")), "无法判断")
+            trigger_text = (
+                "超大单异常=True"
+                if entry.get("super_large_anomaly")
+                else f"资金公式 {entry.get('realtime_formula_wanyuan')} 万 ≥ 2×门槛 {entry.get('effective_threshold')} 万"
+            )
+            series = (
+                "、".join(f"{str(row['date'])[-5:]}:{float(row['net']):+.0f}万" for row in rows[-8:])
+                or "无"
+            )
+            lines.append(
+                f"{symbol}｜{entry.get('name') or '未知名称'}：触发原因：{trigger_text}。"
+                f"近 10 日主力净额序列：{series}。分类结论：{label}。"
+            )
+            for error in item.get("errors") or []:
+                unknowns.append(f"{symbol} 资金历史部分不可用：{error}")
+            if not rows:
+                unknowns.append(f"{symbol} 资金历史不可用：无 Tushare/东财数据源或查询失败")
+            if rows:
+                evidence_item = EvidenceItem(
+                    source_type="tushare",
+                    title=f"{symbol} 资金流历史（{len(rows)} 日）",
+                    excerpt=series,
+                    published_at=str(rows[-1].get("date") or ""),
+                    symbols=[symbol],
+                )
+                evidence.append(evidence_item)
+            per_symbol.append(
+                {
+                    "symbol": symbol,
+                    "days": len(rows),
+                    "today_net": item.get("today_net"),
+                    "median_5d": item.get("median_5d"),
+                    "classification": item.get("classification"),
+                }
+            )
+        rule_id = task.instructions.split("）", 1)[0].removeprefix("事件触发（")
+        return AgentContribution(
+            agent_id="capital_trace",
+            summary="\n".join(lines) or "资金追查：未定位到资金异常标的。",
+            evidence=evidence,
+            unknowns=unknowns,
+            structured_data={"per_symbol": per_symbol, "rule_id": rule_id},
+        )
+
+    def _run_bearish_analysis_workflow(self, task: AgentTask, report: ParsedReport) -> AgentContribution:
+        self._emit_workflow_plan(task)
+        inputs = _event_inputs(task)
+        categories = list(inputs.get("risk_categories") or [])
+        scope = self._workflow_step(
+            task,
+            "risk_scope",
+            lambda: [
+                item
+                for item in _risk_search_scope(report, [], limit=5)
+                if item["symbol"] in task.symbols
+            ],
+        )
+        searched = self._workflow_step(
+            task,
+            "targeted_search",
+            lambda: self._search_negative_news(
+                report,
+                scope,
+                focus="事件触发：" + ("、".join(categories) if categories else "关键利空类别"),
+            ),
+        )
+        classified = self._workflow_step(
+            task,
+            "duration_rubric",
+            lambda: _classify_bearish_duration(searched),
+        )
+        fallback = self._bearish_fallback(task, report, classified, categories)
+        return self._workflow_step(
+            task,
+            "bearish_explanation",
+            lambda: self._llm_contribution(task, report, fallback),
+        )
+
+    def _bearish_fallback(
+        self,
+        task: AgentTask,
+        report: ParsedReport,
+        classified: dict,
+        categories: list[str],
+    ) -> AgentContribution:
+        evidence: list[EvidenceItem] = list(classified.get("evidence") or [])
+        lines: list[str] = []
+        per_symbol: dict = {}
+        for symbol in {row.symbol for row in report.stocks}:
+            items = [item for item in evidence if symbol in item.symbols]
+            structural = [
+                item
+                for item in items
+                if _bearish_duration(str(item.title) + " " + str(item.excerpt)) == "structural"
+            ]
+            event_driven = [
+                item
+                for item in items
+                if _bearish_duration(str(item.title) + " " + str(item.excerpt)) == "event_driven"
+            ]
+            per_symbol[symbol] = {
+                "structural": [
+                    {"title": item.title, "published_at": item.published_at} for item in structural[:4]
+                ],
+                "event_driven": [
+                    {"title": item.title, "published_at": item.published_at} for item in event_driven[:4]
+                ],
+            }
+            if structural:
+                lines.append(
+                    f"{symbol}：结构性利空（长期影响公司治理、经营或再融资）——"
+                    + "；".join(item.title for item in structural[:3])
+                    + "。"
+                )
+            if event_driven:
+                lines.append(
+                    f"{symbol}：事件性利空（短期压力取决于触发节奏）——"
+                    + "；".join(item.title for item in event_driven[:3])
+                    + "。"
+                )
+        unknowns = list(classified.get("unknowns") or [])
+        rule_id = task.instructions.split("）", 1)[0].removeprefix("事件触发（")
+        return AgentContribution(
+            agent_id="bearish_analysis",
+            summary="\n".join(lines) or "利空分析：未检索到可分类的利空事件。",
+            evidence=evidence,
+            unknowns=unknowns,
+            structured_data={
+                "per_symbol": per_symbol,
+                "trigger_categories": categories,
+                "rule_id": rule_id,
+            },
+        )
+
+    def _run_global_sector_flow_workflow(self, task: AgentTask, report: ParsedReport) -> AgentContribution:
+        self._emit_workflow_plan(task)
+        self._workflow_step(
+            task,
+            "session_scope",
+            lambda: "行业 ETF 取当地交易日严格早于 A 股报告日的最近收盘",
+        )
+        snapshot = self._workflow_step(
+            task,
+            "sector_fetch",
+            lambda: self.global_market_client.sector_snapshot(
+                report.generated_at or report.report_date or report.run_slot
+            ),
+        )
+        anomaly = self._workflow_step(
+            task,
+            "anomaly_sort",
+            lambda: _anomaly_sectors(snapshot),
+        )
+        contribution = self._global_sector_contribution(snapshot, anomaly)
+        return self._workflow_step(
+            task,
+            "sector_explanation",
+            lambda: self._llm_contribution(task, report, contribution),
+        )
+
+    def _global_sector_contribution(self, snapshot: dict, anomaly: list[dict]) -> AgentContribution:
+        sectors = list(snapshot.get("sectors") or [])
+        status = str(snapshot.get("status") or "unavailable")
+        lines = [str(snapshot.get("notice") or "外围行业 ETF 数据不可用。")]
+        if sectors:
+            lines.append(
+                "行业 ETF 走势："
+                + "；".join(
+                    f"{item['name']} {float(item.get('change_percent') or 0):+.2f}%"
+                    for item in sectors[:10]
+                )
+                + "。"
+            )
+        if anomaly:
+            lines.append(
+                "异常板块（|涨跌幅|≥2%）："
+                + "；".join(
+                    f"{item['name']} {item['direction']} {abs(item['change_percent']):.2f}%"
+                    for item in anomaly
+                )
+                + "。"
+            )
+        else:
+            lines.append("本轮行业 ETF 未出现达到阈值的异常板块。")
+        evidence: list[EvidenceItem] = []
+        if status == "live_delayed":
+            for item in sectors[:10]:
+                evidence.append(
+                    EvidenceItem(
+                        source_type="market_data",
+                        title=f"{item['name']} 行业 ETF 延迟行情",
+                        excerpt=(
+                            f"最近收盘 {item.get('close')}，"
+                            f"涨跌幅 {float(item.get('change_percent') or 0):+.2f}%。"
+                        ),
+                        url=str(item.get("source_url") or ""),
+                        published_at=str(item.get("trade_date") or ""),
+                        symbols=[str(item.get("ticker") or "")],
+                    )
+                )
+        unknowns: list[str] = []
+        if status == "demo_fallback":
+            unknowns.append("外围行业 ETF 行情接口不可用，当前为演示占位数据，不触发板块传导链")
+        unknowns.extend(str(item) for item in snapshot.get("errors") or [])
+        return AgentContribution(
+            agent_id="global_sector_flow",
+            summary="\n".join(lines),
+            evidence=evidence,
+            unknowns=unknowns,
+            structured_data={
+                "sectors": sectors,
+                "status": status,
+                "anomaly_sectors": anomaly,
+                "notice": str(snapshot.get("notice") or ""),
+                "errors": list(snapshot.get("errors") or []),
+            },
+        )
+
+    def _run_sector_transmission_workflow(self, task: AgentTask, report: ParsedReport) -> AgentContribution:
+        self._emit_workflow_plan(task)
+        inputs = _event_inputs(task)
+        anomaly = list(inputs.get("anomaly_sectors") or [])
+        resolved = self._workflow_step(
+            task,
+            "mapping_resolve",
+            lambda: _resolve_transmissions(anomaly),
+        )
+        boards_payload = self._workflow_step(
+            task,
+            "board_fetch",
+            lambda: self._fetch_industry_boards(),
+        )
+        ranked = self._workflow_step(
+            task,
+            "transmission_rank",
+            lambda: _rank_transmissions(resolved, boards_payload),
+        )
+        fallback = self._transmission_fallback(ranked, boards_payload)
+        return self._workflow_step(
+            task,
+            "transmission_explanation",
+            lambda: self._llm_contribution(task, report, fallback),
+        )
+
+    def _fetch_industry_boards(self) -> dict:
+        if self.public_a_stock_client is None:
+            return {"boards": [], "error": "未配置公共行情客户端"}
+        try:
+            return {"boards": self.public_a_stock_client.industry_board_quotes(limit=100), "error": ""}
+        except Exception as exc:
+            return {"boards": [], "error": _external_error(exc)}
+
+    def _transmission_fallback(self, ranked: list[dict], payload: dict) -> AgentContribution:
+        lines: list[str] = []
+        unknowns: list[str] = []
+        error = str(payload.get("error") or "")
+        if error:
+            unknowns.append(f"A 股板块行情不可用：{error}")
+        for item in ranked:
+            boards = item["a_share_boards"]
+            board_text = (
+                "；".join(
+                    f"{board['name']}({board['change_percent']:+.2f}%→{board['direction']})"
+                    for board in boards
+                )
+                or "暂无匹配的 A 股板块行情"
+            )
+            lines.append(
+                f"{item['foreign_ticker']} {item['foreign_name']} {item['foreign_change_percent']:+.2f}% "
+                f"→ A 股映射板块：{board_text}。"
+            )
+        if not lines:
+            lines.append("板块传导映射：本轮没有可映射的异常板块。")
+        return AgentContribution(
+            agent_id="sector_transmission",
+            summary="\n".join(lines),
+            unknowns=unknowns,
+            structured_data={"transmissions": ranked},
         )
 
     def _emit_workflow_plan(self, task: AgentTask) -> None:
@@ -825,7 +1829,7 @@ class Harness:
                 avoided += 1
                 continue
             formula = row.realtime_formula_wanyuan or Decimal("0")
-            threshold = row.flow_threshold_wanyuan or Decimal("0")
+            threshold = _row_effective_threshold(row)
             funding_ok = formula >= threshold
             failures = []
             if not funding_ok:
@@ -856,10 +1860,10 @@ class Harness:
         candidates.sort(
             key=lambda item: (
                 item[0],
-                -(item[2].realtime_formula_wanyuan - item[2].flow_threshold_wanyuan)
+                -(item[2].realtime_formula_wanyuan - _row_effective_threshold(item[2]))
                 if item[0] == 1
                 else item[1],
-                -(item[2].main_net_wanyuan or Decimal("0")),
+                -(item[2].super_net_wanyuan or Decimal("0")),
                 item[2].symbol,
             )
         )
@@ -909,7 +1913,7 @@ class Harness:
         if candidates:
             lines.append(f"\n候选观察（{len(candidates)} 只）：")
             for index, (priority, gap, row, failures) in enumerate(candidates, 1):
-                surplus = (row.realtime_formula_wanyuan or Decimal("0")) - (row.flow_threshold_wanyuan or Decimal("0"))
+                surplus = (row.realtime_formula_wanyuan or Decimal("0")) - _row_effective_threshold(row)
                 reason = {
                     1: f"资金已超过门槛 {_number(abs(surplus))} 万元，但还差：{'、'.join(failures)}",
                     2: f"其他盘口条件都通过，资金还差 {_number(gap)} 万元",
@@ -941,12 +1945,37 @@ class Harness:
             risks.append(f"{missing_count} 行存在核心字段缺失")
         if anomaly_symbols:
             risks.append("这些标的存在超大单与大单方向相反：" + "、".join(anomaly_symbols))
+        flow_structure = [
+            {
+                "symbol": row.symbol,
+                "name": str(row.name or ""),
+                "level": "formal",
+                "super_net_wanyuan": _flow_net(row.super_net_wanyuan),
+                "large_net_wanyuan": _flow_net(row.large_net_wanyuan),
+                "medium_net_wanyuan": _flow_net(row.medium_net_wanyuan),
+                "small_net_wanyuan": _flow_net(row.small_net_wanyuan),
+            }
+            for row in formal
+        ]
+        flow_structure.extend(
+            {
+                "symbol": row.symbol,
+                "name": str(row.name or ""),
+                "level": f"candidate_p{priority}",
+                "super_net_wanyuan": _flow_net(row.super_net_wanyuan),
+                "large_net_wanyuan": _flow_net(row.large_net_wanyuan),
+                "medium_net_wanyuan": _flow_net(row.medium_net_wanyuan),
+                "small_net_wanyuan": _flow_net(row.small_net_wanyuan),
+            }
+            for priority, _gap, row, _failures in candidates
+        )
         return AgentContribution(
             agent_id="quant_signal",
             summary="\n".join(lines),
             claims=claims,
             evidence=evidence,
             risks=risks,
+            structured_data={"flow_structure": flow_structure},
         )
 
     def _company_contribution(
@@ -1274,6 +2303,8 @@ class Harness:
         contributions: list[AgentContribution],
         review: AgentContribution,
         steering: list[str],
+        *,
+        state: ResearchState | None = None,
     ) -> dict[str, object]:
         recommendations = _recommendation_cards(report, contributions, review)
         recommendation_labels = [str(item["label"]) for item in recommendations]
@@ -1307,36 +2338,67 @@ class Harness:
             "steering_applied": steering,
             "disclaimer": "规则筛选结果仅供研究，不构成交易指令。",
         }
+        if state is not None:
+            fallback["research_state"] = state.model_dump(mode="json")
+            fallback["cross_domain"] = _deterministic_cross_domain(recommendations, contributions)
         if self.llm_client is None:
             return fallback
-        system = self._prompt("coordinator.synthesis", SYNTHESIS_PROMPT)[0]
-        user = json.dumps(
-            {
-                "report_id": report.report_id,
-                "parse_status": report.parse_status,
-                "rule_recommendations": recommendations,
-                "compact_evidence": [
-                    {
-                        "symbol": item["symbol"],
-                        "name": item["name"],
-                        "news_summary": item["news_summary"],
-                        "risk_summary": item["risk_summary"],
-                    }
-                    for item in recommendations
-                ],
-                "risk_review_unknowns": evidence_gaps,
-                "steering": steering,
-            },
-            ensure_ascii=False,
-            default=str,
-        )
+        system = self._prompt("coordinator.synthesis", BRAIN_SYNTHESIS_PROMPT)[0]
+        user_payload: dict[str, object] = {
+            "report_id": report.report_id,
+            "parse_status": report.parse_status,
+            "rule_recommendations": recommendations,
+            "compact_evidence": [
+                {
+                    "symbol": item["symbol"],
+                    "name": item["name"],
+                    "news_summary": item["news_summary"],
+                    "risk_summary": item["risk_summary"],
+                }
+                for item in recommendations
+            ],
+            "risk_review_unknowns": evidence_gaps,
+            "steering": steering,
+        }
+        if state is not None:
+            user_payload["research_state"] = state.model_dump(mode="json")
+            user_payload["event_findings"] = fallback.get("cross_domain") or []
+        user = json.dumps(user_payload, ensure_ascii=False, default=str)
         try:
             result = self.llm_client.complete_json(system, user)
             data = result.data
             required = {"news_summary", "risk_notes", "evidence_gaps"}
             if not required.issubset(data):
-                raise ValueError("统筹模型输出缺少必需字段")
+                raise ValueError("大脑模型输出缺少必需字段")
             symbols = [str(item["symbol"]) for item in recommendations]
+            raw_cross_domain = data.get("cross_domain") or []
+            # 合并规则：专项 Agent 的确定性结论（资金行为分类/利空长短分类/
+            # 板块共振背离）是程序权威结果，模型不得用"未取得"等占位文字覆盖；
+            # overall_view 等判断性字段以模型为准，模型缺失时用确定性兜底。
+            deterministic_cross = {
+                str(item.get("symbol")): dict(item)
+                for item in fallback.get("cross_domain") or []
+            }
+            for item in raw_cross_domain:
+                if not isinstance(item, dict) or str(item.get("symbol") or "") not in symbols:
+                    continue
+                symbol = str(item["symbol"])
+                det = deterministic_cross.get(symbol, {"symbol": symbol})
+                merged = dict(item)
+                merged["symbol"] = symbol
+                for key in ("capital_behavior", "bearish_outlook", "sector_transmission"):
+                    det_value = str(det.get(key) or "").strip()
+                    if det_value and det_value not in (
+                        "本轮未取得相关结论",
+                        "本轮外围市场无异常板块",
+                    ):
+                        merged[key] = det_value
+                    elif not str(merged.get(key) or "").strip():
+                        merged[key] = det_value or "本轮未取得相关结论"
+                if not str(merged.get("overall_view") or "").strip():
+                    merged["overall_view"] = str(det.get("overall_view") or "")
+                deterministic_cross[symbol] = merged
+            cross_domain = [deterministic_cross[symbol] for symbol in symbols if symbol in deterministic_cross]
             final = dict(fallback)
             final.update(
                 {
@@ -1353,14 +2415,16 @@ class Harness:
                     "evidence_gaps": _compact_model_list(
                         data.get("evidence_gaps"), evidence_gaps, limit=3
                     ),
+                    "cross_domain": cross_domain,
                     "model": result.model,
                 }
             )
             self._emit(
                 run_id,
                 "model.usage",
-                agent_id="coordinator",
+                agent_id="brain",
                 payload={
+                    "stage": "synthesis",
                     "model": result.model,
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
@@ -1371,52 +2435,10 @@ class Harness:
             self._emit(
                 run_id,
                 "model.fallback",
-                agent_id="coordinator",
+                agent_id="brain",
                 payload={"stage": "synthesis", "error": f"{type(exc).__name__}: {exc}"},
             )
             return fallback
-
-    def _select_agents(self, run_id: str, report: ParsedReport) -> tuple[list[str], str]:
-        allowed = self.registry.select(report, self.repository)
-        if self.llm_client is None:
-            return allowed, "本地能力规则根据报告结构选择相关专家。"
-        system = self._prompt("coordinator.planning", COORDINATOR_PLANNING_PROMPT)[0]
-        compact = {
-            "parse_status": report.parse_status,
-            "generated_at": report.generated_at,
-            "selected_count": len(report.selected_rows),
-            "near_count": len(report.near_rows),
-            "symbols": [row.symbol for row in report.stocks],
-            "diagnostics": report.diagnostics,
-            "allowed_agents": allowed,
-        }
-        try:
-            result = self.llm_client.complete_json(system, json.dumps(compact, ensure_ascii=False))
-            raw_selected = result.data.get("selected_agents") or []
-            model_selected = [agent_id for agent_id in raw_selected if agent_id in allowed]
-            # Capability rules define the minimum team. The model may explain the
-            # choice, but cannot silently drop a required evidence lane.
-            selected = list(dict.fromkeys([*allowed, *model_selected]))
-            self._emit(
-                run_id,
-                "model.usage",
-                agent_id="coordinator",
-                payload={
-                    "stage": "planning",
-                    "model": result.model,
-                    "prompt_tokens": result.prompt_tokens,
-                    "completion_tokens": result.completion_tokens,
-                },
-            )
-            return selected, str(result.data.get("rationale") or "统筹模型按职责选择了专家。")
-        except Exception as exc:
-            self._emit(
-                run_id,
-                "model.fallback",
-                agent_id="coordinator",
-                payload={"stage": "planning", "error": f"{type(exc).__name__}: {exc}"},
-            )
-            return allowed, "统筹模型不可用，已回退到本地能力规则。"
 
     def _llm_contribution(
         self,
@@ -1443,7 +2465,17 @@ class Harness:
         user = json.dumps(model_input, ensure_ascii=False, default=str)
         try:
             result = self.llm_client.complete_json(system, user)
-            candidate = AgentContribution.model_validate(result.data)
+            # 模型常把输入里的元数据原样抄回输出（task_id/run_id/report_id/
+            # generated_at 等），StrictModel 的 extra=forbid 会把这种输出
+            # 整个判废。这些键只是回显、不携带信息，校验前剥掉，其余
+            # 未知键仍然按严格模式拒绝，安全边界不变。
+            data = _strip_echo_fields(result.data)
+            # summary 是必填字段，而模型截断时最先丢的往往就是它。
+            # 补上确定性兜底的 summary，claim/evidence 校验仍然全量执行——
+            # 模型说不出话时，至少确定性内容完整可用，而不是整份作废。
+            if not str(data.get("summary") or "").strip():
+                data["summary"] = fallback.summary
+            candidate = AgentContribution.model_validate(data)
             if candidate.agent_id != task.agent_id:
                 raise ValueError("专业 Agent 返回了错误的 agent_id")
             valid_ids = {item.evidence_id for item in fallback.evidence}
@@ -1482,6 +2514,10 @@ class Harness:
             "company_industry": "核验公司与行业背景",
             "global_market": "汇总美股、韩国与日本核心指数走势",
             "risk": "逐票检索近期负面公告与新闻",
+            "capital_trace": "追查资金异常标的的资金流历史",
+            "bearish_analysis": "分析利空事件的持续性与影响范围",
+            "global_sector_flow": "定位外围异常板块",
+            "sector_transmission": "映射外围板块到 A 股板块",
         }.get(agent_id, "执行专业分析")
 
     def _prompt(self, prompt_id: str, fallback: str) -> tuple[str, str]:
@@ -1509,21 +2545,26 @@ class Harness:
 
 
 def _agent_display_name(agent_id: str) -> str:
-    return {
-        "quant_signal": "量化信号 Agent",
-        "company_industry": "公司与行业 Agent",
-        "global_market": "外围市场 Agent",
-        "risk": "风险 Agent",
-    }.get(agent_id, agent_id)
+    profile = _PROFILE_BY_ID.get(agent_id)
+    return profile.display_name if profile else agent_id
 
 
 def _agent_responsibility(agent_id: str) -> str:
-    return {
+    specific = {
         "quant_signal": "复核 PTrade 量化字段、正式观察和候选规则，只解释确定性数据",
-        "company_industry": "查询公司身份、财务、公告、新闻和行业资料，可按统筹问题补查",
+        "company_industry": "查询公司身份、财务、公告、新闻和行业资料，可按大脑补充需求补查",
         "global_market": "核对报告日对应的美股、韩国与日本指数日期、点位和涨跌",
         "risk": "逐票检索报告日前的负面公告和新闻，并总结有来源的潜在利空",
-    }.get(agent_id, "执行现有职责范围内的补充分析")
+        "brain": "确定核心问题、审阅研究状态并做跨域定性；不碰工具、不派单",
+        "capital_trace": "查询资金异常标的近 10 日资金流历史，区分单日脉冲与持续异动",
+        "bearish_analysis": "按规则区分结构性（长期）与事件性（短期）利空并说明影响范围",
+        "global_sector_flow": "查询外围行业 ETF 涨跌并定位异常板块",
+        "sector_transmission": "把外围异常板块映射到 A 股对应板块并判定共振或背离",
+    }
+    if agent_id in specific:
+        return specific[agent_id]
+    profile = _PROFILE_BY_ID.get(agent_id)
+    return profile.description if profile else "执行现有职责范围内的补充分析"
 
 
 def _compact_contribution_for_review(contribution: AgentContribution | None) -> dict | None:
@@ -1564,6 +2605,391 @@ def _follow_up_signature(agent_id: str, instructions: str, symbols: list[str]) -
     return f"{agent_id}|{','.join(sorted(symbols))}|{normalized}"
 
 
+def _validated_agent_calls(
+    raw: object,
+    available: list[str],
+    valid_symbols: set[str],
+    *,
+    limit: int = 3,
+) -> list[dict]:
+    """校验大脑的研究指令：agent 白名单、symbols 交集、问题长度、去重。"""
+    calls: list[dict] = []
+    seen: set[str] = set()
+    for item in list(raw or [])[:limit]:
+        if not isinstance(item, dict):
+            continue
+        agent_id = str(item.get("agent_id") or "")
+        question = str(item.get("question") or "").strip()[:1000]
+        if agent_id not in available or len(question) < 8:
+            continue
+        symbols = [str(symbol) for symbol in item.get("symbols") or [] if str(symbol) in valid_symbols][:3]
+        reason = str(item.get("reason") or "").strip()[:500]
+        priority = int(item.get("priority") or 2)
+        normalized_question = re.sub(r"\s+", " ", question).strip().lower()
+        signature = f"{agent_id}|{normalized_question}"
+        if signature in seen:
+            continue
+        seen.add(signature)
+        calls.append(
+            {
+                "agent_id": agent_id,
+                "question": question,
+                "symbols": symbols,
+                "reason": reason,
+                "priority": priority,
+            }
+        )
+    return calls
+
+
+def _compact_structured(structured: dict) -> dict:
+    """压缩 structured_data 进 ResearchState：列表/字典截断，标量保留。"""
+    compact: dict = {}
+    for key, value in structured.items():
+        if isinstance(value, list):
+            compact[key] = value[:8]
+        elif isinstance(value, dict):
+            compact[key] = dict(list(value.items())[:8])
+        else:
+            compact[key] = value
+    return compact
+
+
+def _deterministic_cross_domain(
+    recommendations: list[dict], contributions: list[AgentContribution]
+) -> list[dict]:
+    """从事件 Agent 的确定性结论构建逐票跨域判断；模型综合时在此基础上覆盖。"""
+    latest = {item.agent_id: item for item in _latest_contributions_by_agent(contributions)}
+    # 同一 Agent 可能被派发多次（规则触发 + 大脑补查），per_symbol 按标的聚合，
+    # 保证每一票的结论都进跨域判断；transmission 为市场级结论，取最新一份。
+    capital_per: dict[str, dict] = {}
+    for contribution in contributions:
+        if contribution.agent_id != "capital_trace":
+            continue
+        for item in (contribution.structured_data or {}).get("per_symbol") or []:
+            capital_per.setdefault(str(item.get("symbol")), item)
+    bearish_per: dict[str, dict] = {}
+    for contribution in contributions:
+        if contribution.agent_id != "bearish_analysis":
+            continue
+        for symbol, item in ((contribution.structured_data or {}).get("per_symbol") or {}).items():
+            bearish_per.setdefault(str(symbol), item)
+    transmission = latest.get("sector_transmission")
+    transmissions: list[dict] = []
+    if transmission is not None:
+        transmissions = (transmission.structured_data or {}).get("transmissions") or []
+    transmission_text = "；".join(
+        f"{item.get('foreign_name')} {float(item.get('foreign_change_percent') or 0):+.2f}%"
+        f"→A股映射板块："
+        + "、".join(board.get("name", "") for board in item.get("a_share_boards") or [])
+        for item in transmissions
+    )
+    cross_domain: list[dict] = []
+    for item in recommendations:
+        symbol = str(item["symbol"])
+        entry: dict = {"symbol": symbol}
+        capital_item = capital_per.get(symbol)
+        if capital_item and capital_item.get("classification"):
+            entry["capital_behavior"] = _CAPITAL_CLASSIFICATION_LABELS.get(
+                str(capital_item["classification"]), "本轮未取得相关结论"
+            )
+        bearish_item = bearish_per.get(symbol) or {}
+        structural = [x.get("title") for x in bearish_item.get("structural") or []]
+        event_driven = [x.get("title") for x in bearish_item.get("event_driven") or []]
+        if structural or event_driven:
+            parts = []
+            if structural:
+                parts.append("结构性（长期）：" + "；".join(structural[:2]))
+            if event_driven:
+                parts.append("事件性（短期）：" + "；".join(event_driven[:2]))
+            entry["bearish_outlook"] = "。".join(parts)
+        entry.setdefault("capital_behavior", "本轮未取得相关结论")
+        entry.setdefault("bearish_outlook", "本轮未取得相关结论")
+        entry.setdefault(
+            "sector_transmission",
+            transmission_text[:400] if transmission_text else "本轮外围市场无异常板块",
+        )
+        entry["overall_view"] = "见规则推荐卡片的量化依据与消息面、风险摘要。"
+        cross_domain.append(entry)
+    return cross_domain
+
+
+def _event_inputs(task: AgentTask) -> dict:
+    """从事件任务书中取回触发器数据（_event_task 嵌入的 JSON）。"""
+    match = re.search(r"触发器数据：(.*?)。职责内完成分析", task.instructions, flags=re.S)
+    if not match:
+        return {}
+    try:
+        value = json.loads(match.group(1))
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _event_scope_for(record: TriggerRecord, report: ParsedReport) -> set[str]:
+    """一次事件派单覆盖的标的范围（用于大脑点名时的覆盖度去重）。
+
+    市场级 Agent（外围板块资金/板块传导映射）覆盖全市场，记为 {"*"}；
+    利空分析覆盖全部报告标的；资金追查只覆盖触发器命中的标的。
+    """
+    if record.agent_id in ("global_sector_flow", "sector_transmission"):
+        return {"*"}
+    if record.agent_id == "bearish_analysis":
+        return {row.symbol for row in report.stocks}
+    rows = (record.inputs or {}).get("rows") or []
+    return {str(row.get("symbol")) for row in rows if row.get("symbol")}
+
+
+def _capital_trigger_rows(
+    report: ParsedReport,
+    inputs: dict,
+    restrict_symbols: list[str] | None = None,
+) -> list[dict]:
+    """锁定资金异常标的：优先用触发器数据，缺失时按同一口径从报告重算。
+
+    大脑点名补查时用 restrict_symbols 把范围收窄到大脑指定的标的。
+    """
+    rows: list[dict] = []
+    raw_rows = list(inputs.get("rows") or [])
+    if not raw_rows:
+        for row in report.stocks:
+            threshold = _row_effective_threshold(row)
+            formula = row.realtime_formula_wanyuan
+            if row.super_large_anomaly is True or (
+                formula is not None and threshold is not None and formula >= threshold * 2
+            ):
+                raw_rows.append(
+                    {
+                        "symbol": row.symbol,
+                        "super_large_anomaly": row.super_large_anomaly,
+                        "realtime_formula_wanyuan": float(formula) if formula is not None else None,
+                        "effective_threshold": float(threshold) if threshold is not None else None,
+                    }
+                )
+    for item in raw_rows:
+        if not isinstance(item, dict) or not item.get("symbol"):
+            continue
+        if restrict_symbols is not None and str(item["symbol"]) not in restrict_symbols:
+            continue
+        stock = next((row for row in report.stocks if row.symbol == item["symbol"]), None)
+        rows.append(
+            {
+                "symbol": str(item["symbol"]),
+                "name": stock.name if stock else "",
+                "super_large_anomaly": bool(item.get("super_large_anomaly")),
+                "realtime_formula_wanyuan": item.get("realtime_formula_wanyuan"),
+                "effective_threshold": item.get("effective_threshold"),
+            }
+        )
+    if restrict_symbols is not None:
+        # 大脑点名补查：范围以大脑指定的标的为准（规则未命中也可以查）。
+        for symbol in restrict_symbols:
+            if any(row["symbol"] == symbol for row in rows):
+                continue
+            stock = next((row for row in report.stocks if row.symbol == symbol), None)
+            if stock is None:
+                continue
+            threshold = _row_effective_threshold(stock)
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": stock.name,
+                    "super_large_anomaly": stock.super_large_anomaly,
+                    "realtime_formula_wanyuan": (
+                        float(stock.realtime_formula_wanyuan)
+                        if stock.realtime_formula_wanyuan is not None
+                        else None
+                    ),
+                    "effective_threshold": (
+                        float(threshold) if threshold is not None else None
+                    ),
+                }
+            )
+    rows.sort(key=lambda item: abs(item["realtime_formula_wanyuan"] or 0), reverse=True)
+    return rows[:3]
+
+
+def _classify_capital_pulses(history: dict) -> dict:
+    """确定性分类：单日脉冲 / 持续流入 / 持续流出 / 数据不足。"""
+    classified: dict = {}
+    for symbol, item in history.items():
+        rows = [row for row in item.get("rows") or [] if row.get("net") is not None]
+        base = {**item, "rows": rows[-10:]}
+        if len(rows) < 3:
+            classified[symbol] = {
+                **base,
+                "classification": "insufficient_data",
+                "today_net": None,
+                "median_5d": None,
+            }
+            continue
+        today_net = float(rows[-1]["net"])
+        prior = rows[-6:-1] if len(rows) >= 6 else rows[:-1]
+        median_5d = statistics.median(abs(float(row["net"])) for row in prior)
+        recent = rows[-5:]
+        if len(prior) >= 5 and median_5d > 0 and abs(today_net) >= 2 * median_5d:
+            classification = "single_day_pulse"
+        elif sum(1 for row in recent if float(row["net"]) > 0) >= 3:
+            classification = "persistent_inflow"
+        elif sum(1 for row in recent if float(row["net"]) < 0) >= 3:
+            classification = "persistent_outflow"
+        else:
+            classification = "single_day_pulse"
+        classified[symbol] = {
+            **base,
+            "classification": classification,
+            "today_net": round(today_net, 2),
+            "median_5d": round(median_5d, 2),
+        }
+    return classified
+
+
+_BEARISH_STRUCTURAL_WORDS = (
+    "立案", "调查", "退市", "风险警示", "ST", "诉讼", "仲裁", "违约", "逾期",
+    "资金占用", "担保", "破产", "重整", "失信",
+)
+_BEARISH_EVENT_WORDS = (
+    "减持", "解禁", "质押", "问询", "警示函", "预亏", "下修", "亏损", "停产",
+    "事故", "召回", "减值",
+)
+
+
+def _bearish_duration(text: str) -> str:
+    if _contains_risk_keyword(text, _BEARISH_STRUCTURAL_WORDS):
+        return "structural"
+    if _contains_risk_keyword(text, _BEARISH_EVENT_WORDS):
+        return "event_driven"
+    return "unclassified"
+
+
+def _classify_bearish_duration(searched: dict) -> dict:
+    """对补查证据做长期/短期 rubric 分类，保留证据与失败项。"""
+    evidence = list(searched.get("evidence") or [])
+    per_item = {
+        item.evidence_id: _bearish_duration(str(item.title) + " " + str(item.excerpt))
+        for item in evidence
+    }
+    return {
+        "evidence": evidence,
+        "unknowns": list(searched.get("unknowns") or []),
+        "per_item": per_item,
+    }
+
+
+def _anomaly_sectors(snapshot: dict) -> list[dict]:
+    sectors = sorted(
+        (item for item in snapshot.get("sectors") or [] if item.get("change_percent") is not None),
+        key=lambda item: abs(float(item["change_percent"])),
+        reverse=True,
+    )
+    top: list[dict] = []
+    for item in sectors[:3]:
+        change = float(item["change_percent"])
+        if abs(change) >= EVENT_SECTOR_MOVE_THRESHOLD_PCT:
+            top.append(
+                {
+                    "ticker": str(item["ticker"]),
+                    "name": str(item["name"]),
+                    "change_percent": round(change, 2),
+                    "direction": "上涨" if change > 0 else "下跌",
+                    "trade_date": str(item.get("trade_date") or ""),
+                }
+            )
+    return top
+
+
+def _resolve_transmissions(anomaly: list[dict]) -> list[dict]:
+    resolved: list[dict] = []
+    for item in anomaly:
+        ticker = str(item.get("ticker") or "")
+        entry = SECTOR_TRANSMISSION_MAP.get(ticker)
+        if not entry:
+            continue
+        resolved.append(
+            {
+                "foreign_ticker": ticker,
+                "foreign_name": str(item.get("name") or entry["name"]),
+                "foreign_change_percent": float(item.get("change_percent") or 0),
+                "a_share_keywords": list(entry["a_share_boards"]),
+            }
+        )
+    return resolved
+
+
+def _rank_transmissions(resolved: list[dict], payload: dict) -> list[dict]:
+    boards = list(payload.get("boards") or [])
+    transmissions: list[dict] = []
+    for item in resolved:
+        keywords = item["a_share_keywords"]
+        matched = [
+            board
+            for board in boards
+            if any(keyword in str(board.get("name") or "") for keyword in keywords)
+        ]
+        matched.sort(key=lambda board: abs(float(board.get("change_percent") or 0)), reverse=True)
+        foreign_change = item["foreign_change_percent"]
+        rows = []
+        for board in matched[:3]:
+            board_change = float(board.get("change_percent") or 0)
+            if foreign_change > 0 and board_change > 0 or foreign_change < 0 and board_change < 0:
+                direction = "共振"
+            elif foreign_change * board_change < 0:
+                direction = "背离"
+            else:
+                direction = "持平"
+            rows.append(
+                {
+                    "code": str(board.get("code") or ""),
+                    "name": str(board.get("name") or ""),
+                    "change_percent": round(board_change, 2),
+                    "direction": direction,
+                }
+            )
+        transmissions.append(
+            {
+                "foreign_ticker": item["foreign_ticker"],
+                "foreign_name": item["foreign_name"],
+                "foreign_change_percent": round(foreign_change, 2),
+                "a_share_boards": rows,
+            }
+        )
+    transmissions.sort(key=lambda item: abs(item["foreign_change_percent"]), reverse=True)
+    return transmissions[:5]
+
+
+# 模型回显输入元数据时剥掉的键。它们不含专业判断，只是把输入里的
+# task/report 标识原样抄回了输出；StrictModel 的 extra=forbid 会把整份
+# 输出判废，白白烧一次调用。剥掉后其余未知键仍然严格拒绝。
+_ECHO_FIELDS = {
+    "task_id",
+    "run_id",
+    "report_id",
+    "generated_at",
+    "workflow_id",
+    "workflow_version",
+    "run_slot",
+    "parse_status",
+    "diagnostics",
+    "stocks",
+    "deterministic_fallback",
+    "minimum_evidence",
+    "strategy_inputs",
+    "report",
+    "task",
+}
+
+
+def _strip_echo_fields(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return data
+    # 模型偶尔把整个输出包进 {"contribution": {...}} 壳里；AgentContribution
+    # 没有同名字段，取内层不会误伤合法输出。
+    inner = data.get("contribution")
+    if isinstance(inner, dict):
+        data = inner
+    return {key: value for key, value in data.items() if key not in _ECHO_FIELDS}
+
+
 def _compact_report(report: ParsedReport, *, include_unknown: bool = False) -> dict[str, object]:
     excluded_fields = {"raw_row"} if include_unknown else {"raw_row", "unknown_fields"}
     return {
@@ -1576,6 +3002,21 @@ def _compact_report(report: ParsedReport, *, include_unknown: bool = False) -> d
     }
 
 
+def _row_effective_threshold(row: ReportStock) -> Decimal:
+    """该标的的真实资金门槛（单位万元）。
+
+    1000 亿以上通道的门槛是 0.4%×市值，逐票不同；其余沿用解析器
+    注入的 4000 万参考口径。反推市值落在 1000 亿边界模糊窗口内时
+    回退参考口径（见 parser.tiered_flow_threshold_wanyuan）。
+    """
+    tiered = tiered_flow_threshold_wanyuan(
+        row.realtime_formula_wanyuan, row.realtime_formula_ratio_pct
+    )
+    if tiered is not None:
+        return tiered
+    return row.flow_threshold_wanyuan or Decimal("0")
+
+
 def _number(value: Decimal | None) -> str:
     if value is None:
         return "缺失"
@@ -1585,7 +3026,7 @@ def _number(value: Decimal | None) -> str:
 
 def _quant_metrics(row: ReportStock) -> str:
     formula = row.realtime_formula_wanyuan
-    threshold = row.flow_threshold_wanyuan
+    threshold = _row_effective_threshold(row) if row.realtime_formula_wanyuan is not None else None
     difference = formula - threshold if formula is not None and threshold is not None else None
     if difference is None:
         funding = "资金公式或门槛缺失"
@@ -1596,7 +3037,9 @@ def _quant_metrics(row: ReportStock) -> str:
     ratio = f"，占流通市值 {_number(row.realtime_formula_ratio_pct)}%" if row.realtime_formula_ratio_pct is not None else ""
     order_flow = (
         f"超大单 {_number(row.super_net_wanyuan)} 万元，"
-        f"大单 {_number(row.large_net_wanyuan)} 万元，主力净额 {_number(row.main_net_wanyuan)} 万元"
+        f"大单 {_number(row.large_net_wanyuan)} 万元，"
+        f"中单 {_number(row.medium_net_wanyuan)} 万元，"
+        f"小单 {_number(row.small_net_wanyuan)} 万元"
     )
     tape = (
         f"量比 {_number(row.vol_ratio)}，换手率 {_number(row.turnover_now_pct)}%，"
@@ -1610,6 +3053,10 @@ def _quant_stock_line(row: ReportStock, *, index: int, pool: str) -> str:
     return f"{index}. {_security_label(row)}（{pool}）：" + _quant_metrics(row)
 
 
+def _flow_net(value: Decimal | None) -> float | None:
+    return float(value) if value is not None else None
+
+
 def _security_label(row: ReportStock) -> str:
     name = str(row.name or "").strip()
     return f"{row.symbol}｜{name}" if name else row.symbol
@@ -1620,9 +3067,8 @@ def _formal_recommendation_rows(report: ParsedReport) -> list[ReportStock]:
     rows.sort(
         key=lambda row: (
             -(row.super_net_wanyuan or Decimal("0")),
-            -(row.main_net_wanyuan or Decimal("0")),
+            -(row.large_net_wanyuan or Decimal("0")),
             -(row.realtime_formula_ratio_pct or Decimal("0")),
-            row.pct20 or Decimal("0"),
             row.symbol,
         )
     )
@@ -1637,11 +3083,11 @@ def _recommendation_cards(
     cards: list[dict[str, object]] = []
     for row in _formal_recommendation_rows(report):
         formula = row.realtime_formula_wanyuan or Decimal("0")
-        threshold = row.flow_threshold_wanyuan or Decimal("0")
+        threshold = _row_effective_threshold(row)
         surplus = formula - threshold
         quant_summary = (
             f"资金公式 {_number(formula)} 万元，门槛 {_number(threshold)} 万元，"
-            f"高出 {_number(surplus)} 万元；主力净额 {_number(row.main_net_wanyuan)} 万元；"
+            f"高出 {_number(surplus)} 万元；超大单 {_number(row.super_net_wanyuan)} 万元；"
             f"量比 {_number(row.vol_ratio)}，换手率 {_number(row.turnover_now_pct)}%"
         )
         cards.append(

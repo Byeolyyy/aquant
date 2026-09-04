@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fakes import FakeGlobalMarket
 from quant_agent_harness.harness import Harness
 from quant_agent_harness.models import AgentContribution, EvidenceItem
 from quant_agent_harness.parser import parse_ptrade_report
@@ -67,35 +68,6 @@ class FakeTavily:
         }
 
 
-class FakeGlobalMarket:
-    def snapshot(self, as_of=None):
-        self.as_of = as_of
-        return {
-            "status": "live_delayed",
-            "provider": "fake delayed feed",
-            "retrieved_at": "2026-07-31T18:00:00+08:00",
-            "notice": "测试延迟行情",
-            "errors": [],
-            "quality_flags": [],
-            "market_indices": [
-                {
-                    "ticker": "^GSPC", "name": "标普 500", "region": "美国", "currency": "USD",
-                    "trade_date": "2026-07-30", "timezone": "America/New_York", "close": 6300.0,
-                    "previous_close": 6270.0, "change": 30.0, "change_percent": 0.48,
-                    "history": [{"date": "2026-07-29", "close": 6270.0}, {"date": "2026-07-30", "close": 6300.0}],
-                    "source_url": "https://example.com/gspc",
-                },
-                {
-                    "ticker": "^KS11", "name": "KOSPI", "region": "韩国", "currency": "KRW",
-                    "trade_date": "2026-07-31", "timezone": "Asia/Seoul", "close": 3250.0,
-                    "previous_close": 3260.0, "change": -10.0, "change_percent": -0.31,
-                    "history": [{"date": "2026-07-30", "close": 3260.0}, {"date": "2026-07-31", "close": 3250.0}],
-                    "source_url": "https://example.com/kospi",
-                },
-            ],
-        }
-
-
 class HarnessTests(unittest.TestCase):
     def test_final_summary_is_rule_driven_and_stock_specific(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -146,9 +118,9 @@ class HarnessTests(unittest.TestCase):
             report = parse_ptrade_report(RAW)
             repository.save_report(report)
             events = []
-            harness = Harness(repository, events.append)
+            harness = Harness(repository, events.append, global_market_client=FakeGlobalMarket())
             run_id = harness.start(report.report_id)
-            harness.wait(run_id, timeout=5)
+            harness.wait(run_id, timeout=10)
             snapshot = repository.run_snapshot(run_id)
             self.assertIsNotNone(snapshot)
             self.assertEqual(snapshot["status"], "completed")
@@ -158,7 +130,7 @@ class HarnessTests(unittest.TestCase):
             self.assertNotIn("history_pattern", agent_ids)
             self.assertIn("company_industry", agent_ids)
             workflow_agents = [step["agent_id"] for step in plan.payload["workflow_steps"]]
-            self.assertEqual(workflow_agents[-2:], ["risk", "coordinator"])
+            self.assertEqual(workflow_agents[-2:], ["risk", "brain"])
             coordinator_stages = [
                 event.payload.get("stage")
                 for event in events
@@ -176,9 +148,9 @@ class HarnessTests(unittest.TestCase):
             repository.save_report(prior)
             repository.save_report(current)
             events = []
-            harness = Harness(repository, events.append)
+            harness = Harness(repository, events.append, global_market_client=FakeGlobalMarket())
             run_id = harness.start(current.report_id)
-            harness.wait(run_id, timeout=5)
+            harness.wait(run_id, timeout=10)
             plan = next(event for event in events if event.kind == "task.plan")
             agent_ids = {task["agent_id"] for task in plan.payload["tasks"]}
             self.assertNotIn("history_pattern", agent_ids)
@@ -202,6 +174,13 @@ symbol reason realtime_formula_wanyuan flow_threshold_wanyuan vol_ratio turnover
         self.assertIn("第 2 优先级", contribution.summary)
         self.assertIn("第 3 优先级", contribution.summary)
         self.assertIn("资金公式 4300 万元，比门槛高 300 万元", contribution.summary)
+        flow = contribution.structured_data["flow_structure"]
+        self.assertEqual([item["symbol"] for item in flow], ["600000.SS", "000001.SZ", "000002.SZ", "000003.SZ"])
+        self.assertEqual(flow[0]["level"], "formal")
+        self.assertEqual(flow[0]["super_net_wanyuan"], 900.0)
+        self.assertEqual(flow[0]["large_net_wanyuan"], 300.0)
+        self.assertIsNone(flow[0]["medium_net_wanyuan"])
+        self.assertEqual([item["level"] for item in flow[1:]], ["candidate_p1", "candidate_p2", "candidate_p3"])
         self.assertIn("超大单 900 万元", contribution.summary)
 
     def test_configured_external_agents_register_traceable_evidence(self):

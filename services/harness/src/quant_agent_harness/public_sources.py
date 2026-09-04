@@ -178,6 +178,76 @@ class PublicAStockClient:
             )
         return _sort_recent(rows)[:limit]
 
+    def stock_fund_flow_history(self, code: str, *, days: int = 10) -> list[dict[str, Any]]:
+        """个股资金流历史（东财 push2 fflow 日线），返回近 N 个交易日。
+
+        字段顺序由接口固定：日期、主力净额、小单净额、中单净额、大单净额、
+        超大单净额，单位元。失败抛错，由调用方记入 unknowns。
+        """
+        secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
+        data = self._get_json(
+            "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+            {
+                "secid": secid,
+                "klt": "101",
+                "lmt": str(days),
+                "fields1": "f1,f2",
+                "fields2": "f51,f52,f53,f54,f55,f56",
+            },
+            {"Referer": "https://quote.eastmoney.com/"},
+        )
+        rows: list[dict[str, Any]] = []
+        for line in (data.get("data") or {}).get("klines") or []:
+            parts = str(line).split(",")
+            if len(parts) < 6 or not parts[0]:
+                continue
+            try:
+                rows.append(
+                    {
+                        "date": parts[0],
+                        "main_net": float(parts[1]),
+                        "small_net": float(parts[2]),
+                        "medium_net": float(parts[3]),
+                        "large_net": float(parts[4]),
+                        "super_net": float(parts[5]),
+                    }
+                )
+            except ValueError:
+                continue
+        return rows
+
+    def industry_board_quotes(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """东财行业板块行情列表（f12 板块代码 / f14 名称 / f2 现价 / f3 涨跌幅%）。"""
+        data = self._get_json(
+            "https://push2.eastmoney.com/api/qt/clist/get",
+            {
+                "pn": "1",
+                "pz": str(limit),
+                "po": "1",
+                "np": "1",
+                "fltt": "2",
+                "invt": "2",
+                "fid": "f3",
+                "fs": "m:90+t:2+f:!50",
+                "fields": "f2,f3,f12,f14",
+            },
+            {"Referer": "https://quote.eastmoney.com/"},
+        )
+        rows: list[dict[str, Any]] = []
+        for item in (data.get("data") or {}).get("diff") or []:
+            try:
+                rows.append(
+                    {
+                        "code": str(item.get("f12") or ""),
+                        "name": str(item.get("f14") or ""),
+                        "close": float(item.get("f2") or 0),
+                        "change_percent": float(item.get("f3") or 0),
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+        return rows
+
     def _get_json(self, endpoint: str, params: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
         return json.loads(self._get_text(endpoint, params, headers))
 
