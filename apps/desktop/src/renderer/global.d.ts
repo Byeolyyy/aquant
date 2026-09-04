@@ -8,6 +8,11 @@ declare global {
       onEvent: (listener: (event: HarnessEvent) => void) => () => void;
       onCrash: (listener: (message: string) => void) => () => void;
       platform: string;
+      // 仅网页版提供：桌面版没有登录概念，这三项为 undefined，
+      // 渲染层据此跳过登录门。
+      login?: (password: string) => Promise<void>;
+      logout?: () => Promise<void>;
+      authState?: () => Promise<"authed" | "guest">;
     };
   }
 }

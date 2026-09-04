@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from time import sleep
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
@@ -29,7 +31,36 @@ TENCENT_TICKERS = {"^GSPC": "usINX", "^IXIC": "usIXIC", "^DJI": "usDJI"}
 EASTMONEY_SECIDS = {"^KS11": "100.KS11", "^N225": "100.N225"}
 SINA_SYMBOLS = {"^N225": "NK"}
 
-_PROVIDER_LABELS = {"yahoo": "Yahoo Finance", "tencent": "腾讯证券", "eastmoney": "东方财富", "sina": "新浪财经"}
+# 美股 SPDR 行业 ETF：事件规则（外围极端波动）触发外围板块资金 Agent 时，
+# 用它们定位异常板块；腾讯美股行情作为 Yahoo 的备用源。
+SECTOR_ETF_SPECS = (
+    {"ticker": "XLF", "name": "金融", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLK", "name": "科技", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLE", "name": "能源", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLV", "name": "医疗保健", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLY", "name": "可选消费", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLP", "name": "必选消费", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLI", "name": "工业", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLB", "name": "材料", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLRE", "name": "房地产", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+    {"ticker": "XLU", "name": "公用事业", "region": "美国", "currency": "USD", "timezone": "America/New_York"},
+)
+SECTOR_TENCENT_TICKERS = {spec["ticker"]: "us" + spec["ticker"] for spec in SECTOR_ETF_SPECS}
+TENCENT_TICKERS = {**TENCENT_TICKERS, **SECTOR_TENCENT_TICKERS}
+# 东财 WAF 对 100.KS11 的 K 线接口会稳定重置连接，因此 KOSPI 需要第三
+# 备用源：Naver 金融日线 JSON，免 key，返回完整日线历史。
+NAVER_SYMBOLS = {"^KS11": "KOSPI"}
+
+_PROVIDER_LABELS = {
+    "yahoo": "Yahoo Finance",
+    "tencent": "腾讯证券",
+    "eastmoney": "东方财富",
+    "sina": "新浪财经",
+    "naver": "Naver 金融",
+}
+
+# 东财对突发/连续请求会直接重置连接，第三次尝试前留出间隔可显著提高成功率。
+_EASTMONEY_RETRY_DELAY = 1.5
 
 
 def _open(url: str, timeout: int, *, decode: str = "utf-8", headers: dict[str, str] | None = None) -> str:
@@ -140,9 +171,12 @@ def _fetch_tencent(spec: dict[str, str], a_share_report_date: date, timeout: int
 def _fetch_eastmoney(spec: dict[str, str], a_share_report_date: date, timeout: int) -> dict[str, Any]:
     secid = EASTMONEY_SECIDS[spec["ticker"]]
     query = f"?secid={secid}&klt=101&fqt=0&end=20500101&lmt=8&fields1=f1,f2&fields2=f51,f53"
+    hosts = ("push2his.eastmoney.com", "1.push2his.eastmoney.com")
     payload: dict[str, Any] | None = None
     last_error: Exception | None = None
-    for host in ("push2his.eastmoney.com", "1.push2his.eastmoney.com"):
+    for attempt, host in enumerate((*hosts, hosts[0])):
+        if attempt == 2:
+            sleep(_EASTMONEY_RETRY_DELAY)
         url = f"https://{host}/api/qt/stock/kline/get{query}"
         try:
             payload = json.loads(_open(url, timeout))
@@ -168,6 +202,50 @@ def _fetch_eastmoney(spec: dict[str, str], a_share_report_date: date, timeout: i
         "history": history,
         "currency": str(spec["currency"]),
         "source_url": url,
+    }
+
+
+def _fetch_naver(spec: dict[str, str], a_share_report_date: date, timeout: int) -> dict[str, Any]:
+    symbol = NAVER_SYMBOLS[spec["ticker"]]
+    start = (a_share_report_date - timedelta(days=16)).strftime("%Y%m%d")
+    end = (a_share_report_date + timedelta(days=1)).strftime("%Y%m%d")
+    url = (
+        "https://api.finance.naver.com/siseJson.naver?symbol=" + symbol
+        + f"&requestType=1&startTime={start}&endTime={end}&timeframe=day"
+    )
+    text = _open(url, timeout, headers={"Referer": "https://finance.naver.com"})
+    # Naver 返回 JS 数组语法（单引号字符串），不是严格 JSON，用字面量解析。
+    payload = ast.literal_eval(text.replace("null", "None").lstrip())
+    if not isinstance(payload, list):
+        raise RuntimeError("Naver 行情返回为空")
+    history: list[dict[str, Any]] = []
+    for row in payload[1:]:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        raw_date = str(row[0] or "").strip()
+        if len(raw_date) != 8 or not raw_date.isdigit():
+            continue
+        try:
+            close = float(row[4])
+        except (TypeError, ValueError):
+            continue
+        history.append(
+            {
+                "date": f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}",
+                "close": round(close, 2),
+            }
+        )
+    history.sort(key=lambda item: str(item["date"]))
+    if len(history) < 2:
+        raise RuntimeError("有效收盘价不足两日")
+    latest, previous = history[-1], history[-2]
+    return {
+        "trade_date": str(latest["date"]),
+        "close": float(latest["close"]),
+        "previous_close": float(previous["close"]),
+        "history": history,
+        "currency": str(spec["currency"]),
+        "source_url": "https://finance.naver.com/sise/sise_index.naver?code=" + symbol,
     }
 
 
@@ -211,6 +289,7 @@ _PROVIDER_FETCHERS = {
     "tencent": _fetch_tencent,
     "eastmoney": _fetch_eastmoney,
     "sina": _fetch_sina,
+    "naver": _fetch_naver,
 }
 
 
@@ -222,6 +301,8 @@ def _provider_chain(spec: dict[str, str]) -> tuple[str, ...]:
         chain.append("eastmoney")
     if spec["ticker"] in SINA_SYMBOLS:
         chain.append("sina")
+    if spec["ticker"] in NAVER_SYMBOLS:
+        chain.append("naver")
     return tuple(chain)
 
 
@@ -348,9 +429,93 @@ class GlobalMarketClient:
                 failures.append(f"{provider}:{_safe_error(exc)}")
         raise RuntimeError("；".join(failures))
 
+    def sector_snapshot(self, as_of: str | date | datetime | None = None) -> dict[str, Any]:
+        """行业 ETF 快照：与 snapshot 同口径（美股取严格早于 A 股报告日的最近交易日）。
+
+        全部源失败时返回 demo 数据（status=demo_fallback）；事件规则对演示
+        数据不派单（require_live），只用于界面展示。
+        """
+        a_share_report_date = _parse_report_date(as_of)
+        sectors: list[dict[str, Any]] = []
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=len(SECTOR_ETF_SPECS)) as executor:
+            futures = {
+                executor.submit(self._fetch_one, spec, a_share_report_date): spec
+                for spec in SECTOR_ETF_SPECS
+            }
+            for future in as_completed(futures):
+                spec = futures[future]
+                try:
+                    sectors.append(future.result())
+                except Exception as exc:
+                    errors.append(f"{spec['name']}: {_safe_error(exc)}")
+        order = {spec["ticker"]: index for index, spec in enumerate(SECTOR_ETF_SPECS)}
+        sectors.sort(key=lambda item: order.get(item["ticker"], 999))
+        status = "live_delayed"
+        notice = (
+            f"以 A 股报告日 {a_share_report_date.isoformat()} 为锚点，"
+            "各行业 ETF 取当地交易日严格早于报告日的最近收盘。"
+        )
+        if not sectors and self.demo_fallback:
+            sectors = _demo_sector_indices(a_share_report_date)
+            status = "demo_fallback"
+            notice += " 行业 ETF 行情接口暂时不可用，当前为演示数据，不代表真实市场行情。"
+        providers = {item["provider"] for item in sectors}
+        if status == "live_delayed" and providers - {"yahoo"}:
+            fallback_labels = "、".join(
+                _PROVIDER_LABELS.get(p, p) for p in sorted(providers - {"yahoo"})
+            )
+            notice += f" 已自动切换备用行情源（{fallback_labels}），数据为延迟行情。"
+        return {
+            "sectors": sectors,
+            "status": status,
+            "provider": _provider_summary(providers) if status == "live_delayed" else "demo sample",
+            "retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "notice": notice,
+            "errors": errors,
+            "a_share_report_date": a_share_report_date.isoformat(),
+        }
+
 
 def _provider_summary(providers: set[str]) -> str:
     return " / ".join(_PROVIDER_LABELS.get(p, p) for p in sorted(providers)) + " 延迟行情"
+
+
+def _demo_sector_indices(a_share_report_date: date) -> list[dict[str, Any]]:
+    samples = (
+        ("XLK", "科技", 3.5),
+        ("XLE", "能源", -2.8),
+        ("XLF", "金融", 0.6),
+        ("XLV", "医疗保健", -0.4),
+        ("XLY", "可选消费", 1.1),
+    )
+    trade_date = _previous_weekday(a_share_report_date - timedelta(days=1))
+    history_dates = _recent_weekdays(trade_date, 5)
+    values = []
+    for ticker, name, change_percent in samples:
+        close = round(100 * (1 + change_percent / 100), 2)
+        previous = 100.0
+        values.append(
+            {
+                "ticker": ticker,
+                "name": name,
+                "region": "美国",
+                "currency": "USD",
+                "trade_date": trade_date.isoformat(),
+                "timezone": "America/New_York",
+                "close": close,
+                "previous_close": previous,
+                "change": round(close - previous, 2),
+                "change_percent": change_percent,
+                "history": [
+                    {"date": history_dates[index].isoformat(), "close": round(close * factor, 2)}
+                    for index, factor in enumerate((0.988, 0.995, 0.992, 0.998, 1.0))
+                ],
+                "source_url": "",
+                "provider": "demo",
+            }
+        )
+    return values
 
 
 def _demo_indices(a_share_report_date: date) -> list[dict[str, Any]]:

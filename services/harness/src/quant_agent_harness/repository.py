@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from .agent_prompts import PROMPT_DEFINITIONS
 from .models import DEFAULT_AGENT_PROFILES, AgentRuntimeConfig, HarnessEvent, ParsedReport
-from .secret_store import WindowsDPAPI
+from .secret_store import SecretBackend, make_secret_backend
 
 
 def default_data_dir() -> Path:
@@ -25,7 +25,11 @@ def default_data_dir() -> Path:
 
 
 class Repository:
-    def __init__(self, database_path: str | Path | None = None):
+    def __init__(
+        self,
+        database_path: str | Path | None = None,
+        secret_backend: SecretBackend | None = None,
+    ):
         if database_path is None:
             data_dir = default_data_dir()
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -35,6 +39,9 @@ class Repository:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
         self._initialize()
+        self.secret_backend: SecretBackend = secret_backend or make_secret_backend(
+            self._connect, self._lock
+        )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -179,6 +186,27 @@ class Repository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document
                     ON knowledge_chunks(document_id);
+                CREATE TABLE IF NOT EXISTS mail_messages (
+                    source_key TEXT PRIMARY KEY,
+                    uid TEXT NOT NULL DEFAULT '',
+                    message_id TEXT NOT NULL DEFAULT '',
+                    subject TEXT NOT NULL DEFAULT '',
+                    received_at TEXT NOT NULL DEFAULT '',
+                    body_hash TEXT NOT NULL DEFAULT '',
+                    report_id TEXT NOT NULL DEFAULT '',
+                    ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_mail_messages_hash ON mail_messages(body_hash);
+                CREATE TABLE IF NOT EXISTS mail_segments (
+                    group_key TEXT NOT NULL,
+                    part_no INTEGER NOT NULL,
+                    total_parts INTEGER NOT NULL,
+                    subject TEXT NOT NULL DEFAULT '',
+                    body TEXT NOT NULL,
+                    received_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (group_key, part_no)
+                );
                 """
             )
             security_columns = {
@@ -189,6 +217,14 @@ class Repository:
                 connection.execute(
                     "ALTER TABLE security_master ADD COLUMN industry TEXT NOT NULL DEFAULT ''"
                 )
+            # 多用户隔离用的归属列。桌面老库升级后为空串，查询时不过滤，
+            # 行为与加这一列之前完全一致。
+            self._ensure_column(
+                connection, "runs", "owner_session", "owner_session TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column(
+                connection, "reports", "owner_session", "owner_session TEXT NOT NULL DEFAULT ''"
+            )
             for profile in DEFAULT_AGENT_PROFILES:
                 connection.execute(
                     "INSERT OR IGNORE INTO agent_configs(agent_id, enabled) VALUES (?, ?)",
@@ -282,16 +318,32 @@ class Repository:
                             ),
                         )
 
-    def save_report(self, report: ParsedReport) -> None:
+    @staticmethod
+    def _ensure_column(connection: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        """幂等补列。本项目不需要版本化 migration，这就够了。"""
+        existing = {
+            str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+    def save_report(self, report: ParsedReport, *, owner_session: str | None = None) -> None:
         payload = report.model_dump_json()
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO reports
-                    (report_id, content_hash, parse_status, generated_at, payload_json)
-                VALUES (?, ?, ?, ?, ?)
+                    (report_id, content_hash, parse_status, generated_at, payload_json, owner_session)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (report.report_id, report.content_hash, report.parse_status, report.generated_at, payload),
+                (
+                    report.report_id,
+                    report.content_hash,
+                    report.parse_status,
+                    report.generated_at,
+                    payload,
+                    owner_session or "",
+                ),
             )
 
     def get_report(self, report_id: str) -> ParsedReport | None:
@@ -301,11 +353,43 @@ class Repository:
             ).fetchone()
         return ParsedReport.model_validate_json(row["payload_json"]) if row else None
 
-    def list_reports(self, limit: int = 50) -> list[dict[str, Any]]:
+    def find_report_by_hash(self, content_hash: str) -> str | None:
+        """按正文哈希找已存在的报告。
+
+        report_id 是随机 UUID，content_hash 只有普通索引，所以同一份正文
+        存两次会产生两行。收信是幂等的（同一封邮件可能被重复拉到），
+        入库前必须先查这里复用已有 report_id，否则列表里会冒重复项。
+        """
+        if not content_hash:
+            return None
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM reports ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 500)),)
-            ).fetchall()
+            row = connection.execute(
+                "SELECT report_id FROM reports WHERE content_hash=? ORDER BY created_at LIMIT 1",
+                (content_hash,),
+            ).fetchone()
+        return str(row["report_id"]) if row else None
+
+    def list_reports(
+        self, limit: int = 50, *, owner_session: str | None = None
+    ) -> list[dict[str, Any]]:
+        # owner_session 为 None（桌面版）时不过滤；Web 模式下每个会话看到
+        # 「共享的 + 自己的」——邮件来的报告归属为空串，所有人可见。
+        capped = max(1, min(limit, 500))
+        with self._connect() as connection:
+            if owner_session is None:
+                rows = connection.execute(
+                    "SELECT payload_json FROM reports ORDER BY created_at DESC LIMIT ?",
+                    (capped,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT payload_json FROM reports
+                    WHERE owner_session='' OR owner_session=?
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (owner_session, capped),
+                ).fetchall()
         reports = [ParsedReport.model_validate_json(row["payload_json"]) for row in rows]
         return [
             {
@@ -316,6 +400,11 @@ class Repository:
                 "run_slot": report.run_slot,
                 "parse_status": report.parse_status,
                 "stock_count": len(report.stocks),
+                "selected_count": len(report.selected_rows),
+                "near_count": len(report.near_rows),
+                "source": report.source,
+                "mail_subject": report.mail_subject,
+                "mail_received_at": report.mail_received_at,
             }
             for report in reports
         ]
@@ -343,12 +432,156 @@ class Repository:
             ).fetchall()
         return [ParsedReport.model_validate_json(row["payload_json"]) for row in rows]
 
-    def create_run(self, run_id: str, report_id: str) -> None:
+    def mail_message_seen(self, source_key: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM mail_messages WHERE source_key=?", (source_key,)
+            ).fetchone()
+        return row is not None
+
+    def record_mail_message(
+        self,
+        source_key: str,
+        *,
+        uid: str = "",
+        message_id: str = "",
+        subject: str = "",
+        received_at: str = "",
+        body_hash: str = "",
+        report_id: str = "",
+    ) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(
-                "INSERT INTO runs(run_id, report_id, status) VALUES (?, ?, 'planning')",
-                (run_id, report_id),
+                """
+                INSERT INTO mail_messages
+                    (source_key, uid, message_id, subject, received_at, body_hash, report_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    report_id=excluded.report_id
+                """,
+                (source_key, uid, message_id, subject, received_at, body_hash, report_id),
             )
+
+    def save_mail_segment(
+        self,
+        group_key: str,
+        part_no: int,
+        total_parts: int,
+        *,
+        subject: str = "",
+        body: str = "",
+        received_at: str = "",
+    ) -> None:
+        # 同一片重复到达时覆盖即可：主键挡住重复，内容以最后一次为准。
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO mail_segments
+                    (group_key, part_no, total_parts, subject, body, received_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(group_key, part_no) DO UPDATE SET
+                    total_parts=excluded.total_parts,
+                    subject=excluded.subject,
+                    body=excluded.body,
+                    received_at=excluded.received_at,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (group_key, part_no, total_parts, subject, body, received_at),
+            )
+
+    def ready_mail_segments(self) -> list[dict[str, Any]]:
+        """返回已攒齐的分片组，正文按片号升序拼好。"""
+        with self._connect() as connection:
+            groups = connection.execute(
+                """
+                SELECT group_key, MAX(total_parts) AS total_parts, COUNT(*) AS parts
+                FROM mail_segments
+                GROUP BY group_key
+                HAVING parts >= MAX(total_parts)
+                """
+            ).fetchall()
+            ready: list[dict[str, Any]] = []
+            for group in groups:
+                rows = connection.execute(
+                    """
+                    SELECT part_no, subject, body, received_at FROM mail_segments
+                    WHERE group_key=? ORDER BY part_no ASC
+                    """,
+                    (str(group["group_key"]),),
+                ).fetchall()
+                ready.append(
+                    {
+                        "group_key": str(group["group_key"]),
+                        "total_parts": int(group["total_parts"]),
+                        "subject": str(rows[0]["subject"]) if rows else "",
+                        "received_at": str(rows[0]["received_at"]) if rows else "",
+                        "body": "\n\n".join(str(row["body"]) for row in rows),
+                    }
+                )
+        return ready
+
+    def pending_mail_segments(self) -> list[dict[str, Any]]:
+        """还没攒齐的分片组，用于告诉用户"缺第几片"。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT group_key, MAX(total_parts) AS total_parts, COUNT(*) AS parts,
+                       MAX(subject) AS subject, MAX(updated_at) AS updated_at
+                FROM mail_segments
+                GROUP BY group_key
+                HAVING parts < MAX(total_parts)
+                """
+            ).fetchall()
+        return [
+            {
+                "group_key": str(row["group_key"]),
+                "total_parts": int(row["total_parts"]),
+                "received_parts": int(row["parts"]),
+                "subject": str(row["subject"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in rows
+        ]
+
+    def delete_mail_segments(self, group_key: str) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute("DELETE FROM mail_segments WHERE group_key=?", (group_key,))
+
+    def expire_mail_segments(self, cutoff: str) -> list[str]:
+        """清掉过期仍未攒齐的分片组，返回被清掉的组键。
+
+        上游 relay 没有这一步，服务器上因此堆了一百多条永远等不到
+        兄弟片的孤儿。攒齐的组在拼装后会立刻删除，所以这里扫到的
+        都是残缺组。
+        """
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT group_key FROM mail_segments
+                GROUP BY group_key
+                HAVING MAX(updated_at) < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            keys = [str(row["group_key"]) for row in rows]
+            for key in keys:
+                connection.execute("DELETE FROM mail_segments WHERE group_key=?", (key,))
+        return keys
+
+    def create_run(self, run_id: str, report_id: str, *, owner_session: str | None = None) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO runs(run_id, report_id, status, owner_session) VALUES (?, ?, 'planning', ?)",
+                (run_id, report_id, owner_session or ""),
+            )
+
+    def get_run_owner(self, run_id: str) -> str:
+        """运行归属的会话。空串表示无归属（桌面版或历史数据）。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT owner_session FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        return str(row["owner_session"] or "") if row else ""
 
     def update_run(self, run_id: str, status: str, final: dict[str, Any] | None = None) -> None:
         with self._lock, self._connect() as connection:
@@ -387,17 +620,22 @@ class Repository:
             "metrics": _run_metrics(event_values, run["created_at"], run["updated_at"]),
         }
 
-    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 50, *, owner_session: str | None = None) -> list[dict[str, Any]]:
         bounded = max(1, min(limit, 200))
+        # 与 list_reports 不同：运行历史里没有"共享"这一说，Web 模式下
+        # 每个会话只看得到自己发起的运行，否则面试官之间会互相串号。
+        owner_clause = "" if owner_session is None else "WHERE r.owner_session=?"
+        params: tuple[Any, ...] = (bounded,) if owner_session is None else (owner_session, bounded)
         with self._connect() as connection:
             runs = connection.execute(
-                """
+                f"""
                 SELECT r.run_id, r.report_id, r.status, r.created_at, r.updated_at, r.final_json,
                        p.generated_at, p.parse_status, p.payload_json
                 FROM runs r JOIN reports p ON p.report_id = r.report_id
+                {owner_clause}
                 ORDER BY r.created_at DESC LIMIT ?
                 """,
-                (bounded,),
+                params,
             ).fetchall()
             if not runs:
                 return []
@@ -456,7 +694,7 @@ class Repository:
                 {
                     **profile.model_dump(mode="json"),
                     **config.model_dump(mode="json"),
-                    "required": profile.agent_id in {"coordinator", "quant_signal", "risk"},
+                    "required": profile.required,
                 }
             )
         return values
@@ -940,39 +1178,19 @@ class Repository:
                     (key, value),
                 )
 
+    # 密钥读写一律走后端：桌面是 DPAPI + SQLite，服务端是只读环境变量。
+    # 方法签名保持不变，调用方无需知道背后是哪一种。
     def secret_is_configured(self, key: str) -> bool:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM secrets WHERE secret_key=?", (key,)
-            ).fetchone()
-        return row is not None
+        return self.secret_backend.is_configured(key)
 
     def get_secret(self, key: str) -> str:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT encrypted_value FROM secrets WHERE secret_key=?", (key,)
-            ).fetchone()
-        if not row:
-            return ""
-        return WindowsDPAPI.decrypt(bytes(row["encrypted_value"]))
+        return self.secret_backend.get(key)
 
     def set_secret(self, key: str, plaintext: str) -> None:
-        encrypted = WindowsDPAPI.encrypt(plaintext)
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO secrets(secret_key, encrypted_value, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(secret_key) DO UPDATE SET
-                    encrypted_value=excluded.encrypted_value,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (key, encrypted),
-            )
+        self.secret_backend.set(key, plaintext)
 
     def delete_secret(self, key: str) -> None:
-        with self._lock, self._connect() as connection:
-            connection.execute("DELETE FROM secrets WHERE secret_key=?", (key,))
+        self.secret_backend.delete(key)
 
 
 def _exchange_for_code(code: str) -> str:

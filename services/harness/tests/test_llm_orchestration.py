@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fakes import FakeGlobalMarket
 from quant_agent_harness.harness import Harness
 from quant_agent_harness.llm import ModelResult
 from quant_agent_harness.parser import parse_ptrade_report
@@ -20,9 +21,21 @@ class FakeModel:
     model = "fake-coordinator"
 
     def complete_json(self, system: str, user: str) -> ModelResult:
-        if "selected_agents" in system:
+        if "core_questions" in system:
             return ModelResult(
-                data={"selected_agents": ["quant_signal", "global_market"], "rationale": "只需要量化和外围市场。"},
+                data={
+                    "research_strategy": "常规分析之外重点核验公司公告。",
+                    "core_questions": ["量化信号是否可靠？", "公司背景是否清晰？"],
+                    "agent_calls": [
+                        {
+                            "agent_id": "company_industry",
+                            "question": "核验浦发银行最近是否有重大公告",
+                            "symbols": ["600000.SS"],
+                            "reason": "补充公司背景",
+                            "priority": 2,
+                        }
+                    ],
+                },
                 model=self.model,
             )
         if "news_summary、risk_notes、evidence_gaps" in system:
@@ -44,16 +57,18 @@ class ReplanningModel(FakeModel):
     def complete_json(self, system: str, user: str) -> ModelResult:
         if "现在不是做最终总结" in system:
             self.review_calls += 1
+            # 每次都返回同一个需求：第一轮派发，第二轮被去重拦下，验证循环上限与去重。
             return ModelResult(
                 data={
-                    "action": "follow_up",
+                    "decision": "continue",
                     "review_summary": "公司资料提到重要监管信息，但缺少进一步核验。",
-                    "tasks": [
+                    "agent_calls": [
                         {
                             "agent_id": "company_industry",
-                            "instructions": "请核验 600000.SS 是否存在正式监管公告，并说明公告日期和对象。",
+                            "question": "请核验 600000.SS 是否存在正式监管公告，并说明公告日期和对象。",
                             "symbols": ["600000.SS"],
                             "reason": "重要监管信息需要正式来源支持",
+                            "priority": 1,
                         }
                     ],
                 },
@@ -69,7 +84,12 @@ class LLMOrchestrationTests(unittest.TestCase):
             report = parse_ptrade_report(RAW)
             repository.save_report(report)
             events = []
-            harness = Harness(repository, events.append, FakeModel())  # type: ignore[arg-type]
+            harness = Harness(
+                repository,
+                events.append,
+                FakeModel(),  # type: ignore[arg-type]
+                global_market_client=FakeGlobalMarket(),  # type: ignore[arg-type]
+            )
             run_id = harness.start(report.report_id)
             harness.wait(run_id, timeout=5)
             plan = next(event for event in events if event.kind == "task.plan")
@@ -98,7 +118,12 @@ class LLMOrchestrationTests(unittest.TestCase):
             repository.save_report(report)
             events = []
             model = ReplanningModel()
-            harness = Harness(repository, events.append, model)  # type: ignore[arg-type]
+            harness = Harness(
+                repository,
+                events.append,
+                model,  # type: ignore[arg-type]
+                global_market_client=FakeGlobalMarket(),  # type: ignore[arg-type]
+            )
             run_id = harness.start(report.report_id)
             harness.wait(run_id, timeout=5)
 
@@ -116,7 +141,7 @@ class LLMOrchestrationTests(unittest.TestCase):
             )
             self.assertIn("追加安排", coordinator_text)
             self.assertIn("核验 600000.SS", coordinator_text)
-            self.assertEqual(model.review_calls, 1)
+            self.assertEqual(model.review_calls, 2)
             self.assertFalse(
                 any(
                     task.get("agent_id") not in {"quant_signal", "company_industry", "global_market", "risk"}

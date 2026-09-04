@@ -46,6 +46,13 @@ def _eastmoney_kline(klines: list[str]) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
 
+def _naver_kline(rows: list[list]) -> bytes:
+    # Naver 返回 JS 数组语法（单引号字符串），测试按真实格式构造。
+    payload = [["날짜", "시가", "고가", "저가", "종가", "거래량", "외국인소진율"], *rows]
+    text = "\n " + json.dumps(payload, ensure_ascii=False).replace('"', "'")
+    return text.encode("utf-8")
+
+
 def _fake_urlopen(request, timeout=None):
     url = str(request.full_url)
     if "query1.finance.yahoo.com" in url:
@@ -178,7 +185,9 @@ class GlobalMarketsFallbackTests(unittest.TestCase):
             raise urllib.error.URLError("unexpected url: " + url)
 
         client = GlobalMarketClient(demo_fallback=False)
-        with mock.patch("quant_agent_harness.global_markets.urllib.request.urlopen", side_effect=urlopen):
+        with mock.patch("quant_agent_harness.global_markets.urllib.request.urlopen", side_effect=urlopen), mock.patch(
+            "quant_agent_harness.global_markets._EASTMONEY_RETRY_DELAY", 0
+        ):
             snapshot = client.snapshot("2026-08-17 14:30:00")
         self.assertEqual(snapshot["status"], "live_delayed")
         by_ticker = {item["ticker"]: item for item in snapshot["market_indices"]}
@@ -192,12 +201,71 @@ class GlobalMarketsFallbackTests(unittest.TestCase):
         self.assertIn("KOSPI", snapshot["errors"][0])
         self.assertIn("新浪财经", snapshot["notice"])
 
+    def test_kospi_falls_back_to_naver_when_eastmoney_resets(self):
+        naver_rows = [
+            ["20260813", 6300.0, 6400.0, 6200.0, 6357.12, 520000, 52.1],
+            ["20260814", 6340.0, 6440.0, 6300.0, 6411.27, 510000, 51.8],
+            ["20260817", 6420.0, 6480.0, 6380.0, 6468.95, 530000, 52.4],
+        ]
+
+        def urlopen(request, timeout=None):
+            url = str(request.full_url)
+            if "query1.finance.yahoo.com" in url:
+                raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+            if "push2his.eastmoney.com" in url:
+                raise urllib.error.URLError("Remote end closed connection without response")
+            if "api.finance.naver.com" in url:
+                return _FakeResponse(_naver_kline(naver_rows))
+            if "qt.gtimg.cn" in url or "ifzq.gtimg.cn" in url:
+                ticker = url.split("=")[-1].split(",")[0]
+                quote = {
+                    "usINX": ("7753.11", "7767.51", "-14.40", "-0.19"),
+                    "usIXIC": ("26729.16", "26803.03", "-73.87", "-0.28"),
+                    "usDJI": ("53732.41", "53839.99", "-107.58", "-0.20"),
+                }[ticker]
+                if "qt.gtimg.cn" in url:
+                    return _FakeResponse(_tencent_quote(ticker, *quote, "2026-08-14 16:41:05"))
+                closes = {
+                    "usINX": ["7728.20", "7740.10", "7750.30", "7767.51", "7753.11"],
+                    "usIXIC": ["26661.95", "26710.20", "26750.40", "26803.03", "26729.16"],
+                    "usDJI": ["53850.00", "53810.20", "53850.60", "53839.99", "53732.41"],
+                }[ticker]
+                rows = [
+                    [date, close, close, close, close, "0", {}, ""]
+                    for date, close in zip(
+                        ("2026-08-10", "2026-08-11", "2026-08-12", "2026-08-13", "2026-08-14"),
+                        closes,
+                    )
+                ]
+                return _FakeResponse(_tencent_kline(ticker, rows))
+            if "stock2.finance.sina.com.cn" in url:
+                raise urllib.error.URLError("sina unavailable in this scenario")
+            raise urllib.error.URLError("unexpected url: " + url)
+
+        client = GlobalMarketClient(demo_fallback=False)
+        with mock.patch("quant_agent_harness.global_markets.urllib.request.urlopen", side_effect=urlopen), mock.patch(
+            "quant_agent_harness.global_markets._EASTMONEY_RETRY_DELAY", 0
+        ):
+            snapshot = client.snapshot("2026-08-17 14:30:00")
+        self.assertEqual(snapshot["status"], "live_delayed")
+        by_ticker = {item["ticker"]: item for item in snapshot["market_indices"]}
+        kospi = by_ticker["^KS11"]
+        self.assertEqual(kospi["provider"], "naver")
+        self.assertEqual(kospi["trade_date"], "2026-08-17")
+        self.assertEqual(kospi["close"], 6468.95)
+        self.assertEqual(kospi["previous_close"], 6411.27)
+        self.assertEqual(kospi["currency"], "KRW")
+        self.assertEqual(kospi["history"][0]["date"], "2026-08-13")
+        self.assertIn("Naver 金融", snapshot["notice"])
+
     def test_all_sources_fail_falls_back_to_demo_without_kosdaq(self):
         def always_fail(_request, timeout=None):
             raise urllib.error.HTTPError("https://x", 403, "Forbidden", None, None)
 
         client = GlobalMarketClient(demo_fallback=True)
-        with mock.patch("quant_agent_harness.global_markets.urllib.request.urlopen", side_effect=always_fail):
+        with mock.patch("quant_agent_harness.global_markets.urllib.request.urlopen", side_effect=always_fail), mock.patch(
+            "quant_agent_harness.global_markets._EASTMONEY_RETRY_DELAY", 0
+        ):
             snapshot = client.snapshot("2026-07-31 14:30:00")
         self.assertEqual(snapshot["status"], "demo_fallback")
         self.assertEqual(len(snapshot["market_indices"]), 5)

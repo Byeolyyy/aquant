@@ -200,6 +200,11 @@ button.danger:hover { background: #85263a; }
 .avatar-global_market { color: #eff7f2; border-color: var(--pine-deep); background: var(--pine); }
 .avatar-risk, .avatar-evidence_risk { color: #fbf0f1; border-color: #7e2334; background: var(--rouge); }
 .avatar-market_event { color: #eef7f5; border-color: #30685c; background: #447e77; }
+.avatar-brain { color: #f0f2f6; border-color: #2c3850; background: #42506b; }
+.avatar-capital_trace { color: #eaf5f3; border-color: #1f4f4a; background: #2b5f66; }
+.avatar-bearish_analysis { color: #f7efe8; border-color: #6e3a24; background: #8a4a2f; }
+.avatar-global_sector_flow { color: #eef3f6; border-color: #35505f; background: #4d6b7d; }
+.avatar-sector_transmission { color: #f8f3e4; border-color: #6d551f; background: #8a6d2f; }
 .avatar-system { border-radius: 50%; background: var(--paper-deep); box-shadow: none; }
 
 /* ---------- 中厅 ---------- */
@@ -362,9 +367,43 @@ td small { display: block; margin-top: 3px; color: var(--muted); }
 .market-index-footer { display: flex; align-items: flex-end; justify-content: space-between; gap: 4px; }
 .market-index-footer span { color: var(--ink); font: 900 10px var(--font-mono); }
 .market-index-footer small { color: var(--muted); font-size: 7px; text-align: right; }
-.global-market-card > footer { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-top: 1px solid var(--line); color: var(--muted); font-size: 8px; line-height: 1.45; }
+.global-market-card > footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; padding: 8px 10px; border-top: 1px solid var(--line); color: var(--muted); font-size: 8px; line-height: 1.45; }
 .global-market-card > footer span { max-width: 62%; }
 .global-market-card > footer small { text-align: right; }
+.market-source-errors { flex-basis: 100%; max-width: 100% !important; color: var(--rouge); }
+
+/* ---------- 量化信号 · 四档资金净额柱状图 ---------- */
+
+.flow-structure-card { margin-top: 13px; overflow: hidden; border: 1px solid var(--ink); border-radius: 6px; background: var(--paper-deep); }
+.flow-structure-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--ink); background: var(--ink); }
+.flow-structure-card > header div span { display: block; margin-bottom: 2px; color: var(--gold); font: 800 7px var(--font-mono); letter-spacing: 1.2px; }
+.flow-structure-card > header div b { color: #f6f0e2; font-size: 12px; font-weight: 700; }
+.flow-legend { display: flex; align-items: center; gap: 6px; color: #d8d0bd; font: 700 8px/1 var(--font-mono); }
+.flow-legend i { display: inline-block; width: 6px; height: 6px; border-radius: 1px; }
+.flow-sw-positive { background: var(--cinnabar); }
+.flow-sw-negative { background: var(--pine); }
+
+.flow-structure-grid { display: flex; flex-wrap: wrap; gap: 10px; padding: 10px 12px; }
+.flow-stock-panel { position: relative; flex: 1 1 148px; max-width: 180px; padding: 8px 8px 4px; border: 1px solid var(--line); border-radius: 4px; background: var(--card); }
+.flow-panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; margin-bottom: 6px; }
+.flow-panel-heading div { min-width: 0; }
+.flow-panel-heading b { display: block; color: var(--ink); font: 700 10px var(--font-mono); }
+.flow-panel-heading small { display: block; margin-top: 2px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.flow-level { flex: none; padding: 2px 5px; border: 1px solid var(--line-strong); border-radius: 3px; color: var(--muted); font: 800 7px/1.2 var(--font-mono); white-space: nowrap; }
+.flow-level.formal { border-color: var(--gold); color: var(--gold-deep); }
+
+.flow-chart { display: block; width: 100%; height: auto; }
+.flow-baseline { stroke: var(--line-strong); stroke-width: 1; }
+.flow-bar-positive { fill: var(--cinnabar); stroke: var(--cinnabar-deep); stroke-width: 0.6; }
+.flow-bar-negative { fill: var(--pine); stroke: var(--pine-deep); stroke-width: 0.6; }
+.flow-bar-missing { fill: none; stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 2 2; }
+.flow-value-label { fill: var(--muted); font: 700 7px var(--font-mono); }
+.flow-bar-hit { fill: transparent; pointer-events: all; }
+.flow-tier-labels { display: flex; }
+.flow-tier-labels span { flex: 1; color: var(--faint); font: 700 7px var(--font-mono); text-align: center; }
+.flow-tooltip { position: absolute; top: 30px; left: 50%; z-index: 6; padding: 3px 7px; border-radius: 3px; background: var(--ink); color: #f6f0e2; font: 700 8px/1.4 var(--font-mono); pointer-events: none; transform: translateX(-50%); white-space: nowrap; }
+.flow-empty { padding: 12px 0; color: var(--faint); font-size: 9px; text-align: center; }
+.flow-structure-card > footer { padding: 8px 10px; border-top: 1px solid var(--line); color: var(--muted); font-size: 8px; line-height: 1.45; }
 
 /* ---------- 资料来源 ---------- */
 
@@ -606,6 +645,34 @@ pre { max-height: 280px; overflow: auto; padding: 11px; border: 1px solid var(--
 .settings-notice { font-size: 10px; }
 .settings-notice.ok { color: var(--pine); }
 .settings-notice.error { color: var(--cinnabar); }
+
+/* 报告入口：邮件选择 / 手动粘贴 两个 tab 与邮件报告列表。 */
+.composer-tabs { display: inline-flex; gap: 4px; margin: 0 0 14px; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper-deep); }
+.composer-tabs button { padding: 6px 14px; border: 0; border-radius: 5px; color: var(--muted); background: transparent; font-size: 11px; font-weight: 650; cursor: pointer; }
+.composer-tabs button.active { color: var(--ink); background: var(--card); box-shadow: 0 1px 3px rgba(42, 37, 30, 0.14); }
+.mail-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; color: var(--muted); font-size: 11px; }
+.mail-picker .search-input { width: 100%; margin-bottom: 10px; font-size: 11px; }
+.mail-report-list { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; padding-right: 4px; }
+.mail-report-row { display: grid; grid-template-columns: minmax(150px, auto) 90px 62px 1fr; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: #fdfaf2; text-align: left; font-size: 11px; cursor: pointer; }
+.mail-report-row:hover { border-color: var(--line-strong); background: var(--card); }
+.mail-report-row:disabled { opacity: 0.55; cursor: default; }
+.mail-report-row b { font-family: var(--font-mono); font-size: 11px; font-weight: 650; }
+.mail-report-row > span { color: var(--muted); font-size: 10px; }
+.mail-report-row small { color: var(--faint); font-size: 10px; text-align: right; }
+.mail-report-empty { padding: 22px 14px; border: 1px dashed var(--line-strong); border-radius: 6px; color: var(--faint); font-size: 11px; text-align: center; line-height: 1.7; }
+
+/* 网页版口令门。桌面版不会渲染到这里。 */
+.login-shell { display: grid; place-items: center; min-height: 100vh; padding: 28px; background: var(--paper); }
+.login-card { width: min(420px, 100%); padding: 30px 30px 24px; border: 1px solid var(--ink); border-radius: 9px; background: var(--card); box-shadow: 0 18px 50px rgba(42, 37, 30, 0.16); }
+.login-card h1 { margin: 6px 0 10px; color: var(--ink); font-size: 22px; font-weight: 700; letter-spacing: -0.4px; }
+.login-card p { margin: 0 0 20px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.login-card label > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 10px; font-weight: 750; }
+.login-card input { width: 100%; padding: 10px 11px; border: 1px solid var(--line-strong); outline: none; border-radius: 5px; color: var(--ink); background: #fdfaf2; font-size: 12px; }
+.login-card input::placeholder { color: var(--faint); }
+.login-card input:focus { border-color: var(--indigo); }
+.login-card .primary { width: 100%; margin-top: 16px; justify-content: center; }
+.login-error { margin-top: 9px; color: var(--cinnabar); font-size: 10px; }
+.login-foot { margin-top: 18px; padding-top: 14px; border-top: 1px dashed var(--line); color: var(--faint); font-size: 9px; line-height: 1.6; }
 
 @media (max-width: 1250px) {
   .app-shell { grid-template-columns: 210px minmax(570px, 1fr) 284px; }

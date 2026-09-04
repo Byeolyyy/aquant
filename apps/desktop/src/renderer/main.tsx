@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 
+import { ensureBridge, onSessionLost } from "../bridge/web";
 import type { HarnessEvent } from "../shared/protocol";
 import { AGENT_NAMES, eventSummary, isMessageEvent } from "./event-utils";
+import { LoginScreen } from "./login";
 import { SettingsModal, type SettingsData } from "./settings-modal";
 import {
   AgentGovernancePanel,
@@ -39,6 +41,23 @@ interface ParsedReport {
   near_rows: StockRow[];
   diagnostics: string[];
   parse_errors: string[];
+  source?: "manual" | "mail";
+  mail_subject?: string;
+  mail_received_at?: string;
+}
+
+interface ReportSummary {
+  report_id: string;
+  generated_at: string;
+  report_date: string;
+  run_slot: string;
+  parse_status: "valid" | "partial" | "invalid";
+  stock_count: number;
+  selected_count: number;
+  near_count: number;
+  source: "manual" | "mail";
+  mail_subject: string;
+  mail_received_at: string;
 }
 
 interface AgentTask {
@@ -90,6 +109,21 @@ interface GlobalMarketData {
   provider: string;
   retrieved_at: string;
   notice: string;
+  errors?: string[];
+}
+
+interface FlowStructureItem {
+  symbol: string;
+  name: string;
+  level: string;
+  super_net_wanyuan: number | null;
+  large_net_wanyuan: number | null;
+  medium_net_wanyuan: number | null;
+  small_net_wanyuan: number | null;
+}
+
+interface QuantSignalData {
+  flow_structure: FlowStructureItem[];
 }
 
 type WorkspaceView = "research" | "runs" | "agents" | "prompts";
@@ -105,13 +139,21 @@ interface RunSnapshot {
   metrics: RunMetrics;
 }
 
-const ROSTER = ["coordinator", "quant_signal", "company_industry", "global_market", "risk"] as const;
+// Agent 团队名单由后端 get_agents 派生；加载完成前先用固定名单占位。
+const DEFAULT_ROSTER = ["brain", "coordinator", "quant_signal", "company_industry", "global_market", "risk"];
 
 function App() {
+  // 网页版有口令门；桌面版的 authState 是 undefined，视为已通过、永不拦。
+  const [session, setSession] = useState<"loading" | "guest" | "authed">(
+    window.quantAgent.authState ? "loading" : "authed"
+  );
+  // 每次成功登录递增：作为 key 强制整棵应用树重挂，避免上次会话的
+  // "服务异常"/设置/邮件列表状态残留到新会话。
+  const [loginGeneration, setLoginGeneration] = useState(0);
   const [service, setService] = useState<"connecting" | "ready" | "error">("connecting");
   const [serviceDetail, setServiceDetail] = useState("正在启动本地 Harness…");
-  const [rawText, setRawText] = useState("");
   const [report, setReport] = useState<ParsedReport | null>(null);
+
   const [runId, setRunId] = useState<string | null>(null);
   const [events, setEvents] = useState<HarnessEvent[]>([]);
   const [busy, setBusy] = useState(false);
@@ -129,8 +171,59 @@ function App() {
   const [promptBusy, setPromptBusy] = useState(false);
   const [snapshotMetrics, setSnapshotMetrics] = useState<RunMetrics | null>(null);
   const [notice, setNotice] = useState("");
+  // 报告入口：只从邮件选择（服务端已配好收信）。
+  const [mailReports, setMailReports] = useState<ReportSummary[]>([]);
+  const [mailBusy, setMailBusy] = useState(false);
+  const [mailNotice, setMailNotice] = useState("");
+  const [mailFilter, setMailFilter] = useState("");
 
   useEffect(() => {
+    // 登录通过后拉一次邮件报告列表；session 变化（重新登录）也会触发。
+    if (session === "authed") void loadMailReports();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session]);
+
+  const filteredMailReports = React.useMemo(() => {
+    const needle = mailFilter.trim().toLowerCase();
+    if (!needle) return mailReports;
+    return mailReports.filter((item) =>
+      [
+        item.mail_subject,
+        item.generated_at,
+        item.mail_received_at,
+        item.run_slot,
+        item.parse_status,
+      ]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(needle))
+    );
+  }, [mailReports, mailFilter]);
+
+  useEffect(() => {
+    // 服务端重启后内存态会话作废，任何 401 都会触发这里：
+    // 回登录门重新输入口令，而不是卡在"服务异常"。
+    onSessionLost(() => {
+      setSession("guest");
+      setService("connecting");
+    });
+  }, []);
+
+  useEffect(() => {
+    // 只在网页版执行：桌面版没有 authState，这个 effect 直接不跑。
+    if (!window.quantAgent.authState) return;
+    let cancelled = false;
+    window.quantAgent.authState().then((state) => {
+      if (!cancelled) setSession(state === "authed" ? "authed" : "guest");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    // 登录成功后才挂事件流与首次探测；登录门切换、重新登录都会触发重跑，
+    // 避免"服务异常"状态残留到新会话。
+    if (session !== "authed") return;
     if (!window.quantAgent) {
       setService("error");
       setServiceDetail("桌面桥接未加载，请重新构建或重新安装应用");
@@ -169,7 +262,9 @@ function App() {
       unsubscribeEvent();
       unsubscribeCrash();
     };
-  }, []);
+    // 依赖 session/loginGeneration：重新登录或会话失效后重挂服务状态。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, loginGeneration]);
 
   const runEvents = useMemo(
     () => (runId ? events.filter((event) => event.run_id === runId) : []),
@@ -290,7 +385,7 @@ function App() {
     setEvents([]);
     setSnapshotMetrics(null);
     setError("");
-    setRawText("");
+    setMailFilter("");
   }
 
   async function openRun(run: RunSummary) {
@@ -355,13 +450,51 @@ function App() {
     }
   }
 
-  async function parseReport() {
+  async function syncMail() {
+    if (mailBusy) return;
+    setMailBusy(true);
+    setMailNotice("");
+    try {
+      const result = await window.quantAgent.request("sync_mailbox", {});
+      const sync = (result.sync || {}) as Record<string, unknown>;
+      const fetched = Number(sync.fetched || 0);
+      const fresh = Number(sync.new_reports || 0);
+      const duplicates = Number(sync.duplicate_reports || 0);
+      const parts = [];
+      if (fetched) parts.push(`收到 ${fetched} 封`);
+      if (fresh) parts.push(`新增 ${fresh} 份报告`);
+      if (duplicates) parts.push(`${duplicates} 份已存在`);
+      if (sync.stored_segments) parts.push(`${sync.stored_segments} 片分片待拼装`);
+      if (sync.expired_groups) parts.push(`清理 ${sync.expired_groups} 组过期分片`);
+      if (Array.isArray(sync.pending_groups) && sync.pending_groups.length) {
+        parts.push(`${sync.pending_groups.length} 组分片等待缺片`);
+      }
+      if (Array.isArray(sync.errors) && sync.errors.length) {
+        parts.push(`${sync.errors.length} 封处理出错`);
+      }
+      setMailNotice(parts.length ? parts.join(" · ") : "邮箱没有新邮件");
+      await loadMailReports();
+    } catch (reason) {
+      setMailNotice(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setMailBusy(false);
+    }
+  }
+
+  async function loadMailReports() {
+    try {
+      const result = await window.quantAgent.request("list_reports", { limit: 50 });
+      setMailReports((result.reports || []) as unknown as ReportSummary[]);
+    } catch (reason) {
+      setMailNotice(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function openMailReport(reportId: string) {
     setBusy(true);
     setError("");
-    setRunId(null);
-    setEvents([]);
     try {
-      const result = await window.quantAgent.request("parse_report", { raw_text: rawText });
+      const result = await window.quantAgent.request("get_report", { report_id: reportId });
       setReport(result.report as unknown as ParsedReport);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -404,8 +537,26 @@ function App() {
     }
   }
 
+  if (session === "guest") {
+    return (
+      <LoginScreen
+        onAuthed={() => {
+          setSession("authed");
+          setLoginGeneration((generation) => generation + 1);
+        }}
+      />
+    );
+  }
+  if (session === "loading") {
+    // 会话探测只花一个往返，不做花哨的加载态。
+    return null;
+  }
+
   return (
-    <div className="app-shell">
+    // key 跟随登录代数变化：每次成功登录后整棵应用树重挂，服务状态、
+    // 设置、邮件列表等一切状态从干净状态重新初始化，
+    // 避免"服务异常"在登录后残留。
+    <div className="app-shell" key={loginGeneration}>
       <header className="topbar">
         <div className="brand-mark">A</div>
         <div>
@@ -430,15 +581,15 @@ function App() {
           <button className={activeView === "prompts" ? "active" : ""} onClick={() => { setActiveView("prompts"); void loadPrompts(); void loadWorkflows(); }}><span>令</span><b>Prompt 工作台</b></button>
         </nav>
         <div className="section-label agents-label">Agent 团队</div>
-        {ROSTER.map((agentId) => (
+        {(agents.length ? agents.map((item) => item.agent_id) : DEFAULT_ROSTER).map((agentId) => (
           <div className="agent-row" key={agentId}>
-            <span className={`avatar avatar-${agentId}`}>{AGENT_NAMES[agentId].slice(0, 1)}</span>
-            <span><b>{AGENT_NAMES[agentId]}</b></span>
+            <span className={`avatar avatar-${agentId}`}>{(AGENT_NAMES[agentId] ?? agentId).slice(0, 1)}</span>
+            <span><b>{AGENT_NAMES[agentId] ?? agentId}</b></span>
             <i className={selectedAgents.has(agentId) || agents.find((item) => item.agent_id === agentId)?.enabled ? "online" : "idle"} />
           </div>
         ))}
         <div className="sidebar-footer">
-          <span>密钥本地加密保存</span>
+          <span>{settings?.storage.writable === false ? "连接由服务端配置" : "密钥本地加密保存"}</span>
         </div>
       </aside>
 
@@ -452,15 +603,59 @@ function App() {
           {!report && (
             <section className="composer-card hero-card">
               <div className="eyebrow">新研究事件</div>
-              <h2>粘贴一份 PTrade 原始报告</h2>
+              <h2>挑一份 PTrade 筛选结果</h2>
               <p>先预览解析结果，确认后再启动多 Agent 研究。</p>
-              <textarea value={rawText} onChange={(event) => setRawText(event.target.value)} placeholder="在此粘贴 PTrade 原始报告…" spellCheck={false} />
-              <div className="card-actions">
-                <span>{rawText.length.toLocaleString()} 字符</span>
-                <button className="primary" disabled={busy || !rawText.trim()} onClick={parseReport}>
-                  {busy ? "正在解析…" : "解析并预览"}
-                </button>
-              </div>
+              {settings?.mail?.auth_code_configured ? (
+                <div className="mail-picker">
+                  <div className="mail-picker-head">
+                    <span>
+                      {mailBusy ? "正在查询邮箱…" : mailNotice || "选择一份报告开始研究"}
+                    </span>
+                    <button className="ghost" disabled={mailBusy || busy} onClick={syncMail}>
+                      {mailBusy ? "同步中…" : "查询最新邮件"}
+                    </button>
+                  </div>
+                  <input
+                    className="search-input"
+                    value={mailFilter}
+                    onChange={(event) => setMailFilter(event.target.value)}
+                    placeholder="按主题 / 日期 / 轮次过滤"
+                    disabled={busy}
+                  />
+                  <div className="mail-report-list">
+                    {filteredMailReports.map((item) => (
+                      <button
+                        className="mail-report-row"
+                        key={item.report_id}
+                        disabled={busy}
+                        onClick={() => openMailReport(item.report_id)}
+                        title={item.mail_subject || undefined}
+                      >
+                        <b>{item.generated_at || item.mail_received_at || "未识别时间"}</b>
+                        <span>{item.run_slot ? `轮次 ${item.run_slot}` : "轮次未知"}</span>
+                        <span className={`quality quality-${item.parse_status}`}>{item.parse_status}</span>
+                        <small>
+                          {item.selected_count ? `精选 ${item.selected_count}` : "无精选"}
+                          {item.near_count ? ` · 近似 ${item.near_count}` : ""}
+                        </small>
+                      </button>
+                    ))}
+                    {filteredMailReports.length === 0 && mailReports.length > 0 && !mailBusy && (
+                      <div className="mail-report-empty">没有匹配过滤条件的报告</div>
+                    )}
+                    {mailReports.length === 0 && !mailBusy && (
+                      <div className="mail-report-empty">
+                        {mailNotice || "还没有可选的报告，点「查询最新邮件」从邮箱收一份"}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="mail-report-empty">
+                  服务端未配置邮箱收信入口。邮件报告由服务器统一配置（/etc/aquant.env 的
+                  QUANT_AGENT_MAIL_*），配置完成后刷新页面即可从邮件选择报告。
+                </div>
+              )}
             </section>
           )}
 
@@ -496,7 +691,7 @@ function App() {
                 </table>
               </div>
               <div className="card-actions">
-                <button className="ghost" onClick={() => setReport(null)}>返回修改原文</button>
+                <button className="ghost" onClick={() => setReport(null)}>{report.source === "mail" ? "返回报告列表" : "返回修改原文"}</button>
                 <button className="primary" disabled={busy || report.parse_status === "invalid"} onClick={startRun}>
                   {report.parse_status === "partial" ? "确认风险并启动研究" : "确认并启动多 Agent 研究"}
                 </button>
@@ -664,6 +859,9 @@ function AgentMessageBody({ event }: { event: HarnessEvent }) {
       {event.agent_id === "global_market" && event.payload.structured_data && (
         <GlobalMarketCard data={event.payload.structured_data as unknown as GlobalMarketData} />
       )}
+      {event.agent_id === "quant_signal" && event.payload.structured_data && (
+        <FlowStructureCard data={event.payload.structured_data as unknown as QuantSignalData} />
+      )}
       {selectedAgents.length > 0 && (
         <div className="team-assembly">
           <span>本轮参与</span>
@@ -689,6 +887,7 @@ function GlobalMarketCard({ data }: { data: GlobalMarketData }) {
       </div>
       <footer>
         <span>{data.notice}</span>
+        {Boolean(data.errors?.length) && <span className="market-source-errors">行情源提示：{data.errors!.join("；")}</span>}
         <small>{data.provider} · 获取于 {formatMarketTime(data.retrieved_at)}</small>
       </footer>
     </section>
@@ -731,6 +930,149 @@ function Sparkline({ points, positive }: { points: MarketHistoryPoint[]; positiv
       <polygon points={area} className={positive ? "spark-fill-positive" : "spark-fill-negative"} />
       <polyline points={coords} className={positive ? "spark-positive" : "spark-negative"} />
     </svg>
+  );
+}
+
+const FLOW_TIERS = [
+  { key: "super_net_wanyuan", label: "超大单" },
+  { key: "large_net_wanyuan", label: "大单" },
+  { key: "medium_net_wanyuan", label: "中单" },
+  { key: "small_net_wanyuan", label: "小单" },
+] as const;
+
+type FlowTierKey = (typeof FLOW_TIERS)[number]["key"];
+
+const FLOW_LEVEL_LABELS: Record<string, string> = {
+  formal: "正式观察",
+  candidate_p1: "P1 候选",
+  candidate_p2: "P2 候选",
+  candidate_p3: "P3 候选",
+};
+
+function flowValueLabel(value: number | null): string {
+  if (value === null || value === undefined) return "—";
+  const rounded = Math.round(value);
+  return `${rounded > 0 ? "+" : ""}${rounded}`;
+}
+
+function FlowStructureCard({ data }: { data: QuantSignalData }) {
+  const items = Array.isArray(data.flow_structure) ? data.flow_structure : [];
+  if (!items.length) return null;
+  return (
+    <section className="flow-structure-card">
+      <header>
+        <div><span>FLOW STRUCTURE</span><b>四档资金净额</b></div>
+        <span className="flow-legend">
+          <i className="flow-sw-positive" />净流入<i className="flow-sw-negative" />净流出
+        </span>
+      </header>
+      <div className="flow-structure-grid">
+        {items.map((item) => <FlowStockPanel item={item} key={item.symbol} />)}
+      </div>
+      <footer>
+        <span>柱高 = 净额绝对值（单位：万元），基线以上为净流入、以下为净流出；数值由 Harness 确定性规则生成。</span>
+      </footer>
+    </section>
+  );
+}
+
+function FlowStockPanel({ item }: { item: FlowStructureItem }) {
+  const [hovered, setHovered] = useState<string | null>(null);
+  const slot = 30;
+  const width = slot * FLOW_TIERS.length;
+  const baseline = 44;
+  const height = 88;
+  const values = FLOW_TIERS.map((tier) => item[tier.key]);
+  const allMissing = values.every((value) => value === null || value === undefined);
+  const maxAbs = Math.max(...values.map((value) => Math.abs(Number(value) || 0)), 1);
+  const plotSpan = 30;
+  if (allMissing) {
+    return (
+      <article className="flow-stock-panel">
+        <FlowPanelHeader item={item} />
+        <div className="flow-empty">四档净额均缺失</div>
+      </article>
+    );
+  }
+  const ariaParts = FLOW_TIERS.map(
+    (tier) => `${tier.label} ${flowValueLabel(item[tier.key])} 万元`
+  );
+  return (
+    <article className="flow-stock-panel">
+      <FlowPanelHeader item={item} />
+      <svg
+        className="flow-chart"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label={`${item.symbol} 四档资金净额：${ariaParts.join("，")}`}
+      >
+        <line className="flow-baseline" x1={4} y1={baseline} x2={width - 4} y2={baseline} />
+        {FLOW_TIERS.map((tier, index) => {
+          const value = item[tier.key];
+          const x = index * slot + (slot - 10) / 2;
+          const missing = value === null || value === undefined;
+          const barHeight = missing ? 0 : Math.max((Math.abs(Number(value)) / maxAbs) * plotSpan, 2);
+          const positive = Number(value) >= 0;
+          const top = positive ? baseline - barHeight : baseline;
+          return (
+            <g key={tier.key}>
+              {missing ? (
+                <rect className="flow-bar-missing" x={x} y={baseline - 2} width={10} height={4} />
+              ) : (
+                <>
+                  <rect
+                    className={positive ? "flow-bar-positive" : "flow-bar-negative"}
+                    x={x}
+                    y={top}
+                    width={10}
+                    height={barHeight}
+                    rx={2}
+                  />
+                  <text
+                    className="flow-value-label"
+                    x={x + 5}
+                    y={positive ? top - 4 : top + barHeight + 10}
+                    textAnchor="middle"
+                  >
+                    {flowValueLabel(value)}
+                  </text>
+                </>
+              )}
+              <rect
+                className="flow-bar-hit"
+                x={index * slot + 2}
+                y={0}
+                width={slot - 4}
+                height={height}
+                onMouseEnter={() => setHovered(tier.key)}
+                onMouseLeave={() => setHovered(null)}
+              />
+            </g>
+          );
+        })}
+      </svg>
+      <div className="flow-tier-labels">
+        {FLOW_TIERS.map((tier) => <span key={tier.key}>{tier.label}</span>)}
+      </div>
+      {hovered && (
+        <div className="flow-tooltip">
+          {FLOW_TIERS.find((tier) => tier.key === hovered)!.label}
+          {"　"}{flowValueLabel(item[hovered as FlowTierKey])} 万元
+        </div>
+      )}
+    </article>
+  );
+}
+
+function FlowPanelHeader({ item }: { item: FlowStructureItem }) {
+  return (
+    <div className="flow-panel-heading">
+      <div>
+        <b>{item.symbol}</b>
+        {item.name && <small>{item.name}</small>}
+      </div>
+      <span className={`flow-level ${item.level}`}>{FLOW_LEVEL_LABELS[item.level] || item.level}</span>
+    </div>
   );
 }
 
@@ -823,6 +1165,10 @@ function calculateLiveMetrics(events: HarnessEvent[]): RunMetrics {
     agent_durations_ms: durations,
   };
 }
+
+// 必须在 React 渲染之前执行：桌面版已由 preload 注入 window.quantAgent
+// （此处为 no-op），浏览器里装上 fetch/EventSource 实现。
+ensureBridge();
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode><App /></React.StrictMode>

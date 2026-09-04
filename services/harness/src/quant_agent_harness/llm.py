@@ -97,13 +97,93 @@ class OpenAICompatibleClient:
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:
+    # 模型输出常见两种毛病：包在代码块里、尾部带解释文字或截断。
+    # 先剥代码块，再取"从最外层 { 到最后一个 }"之间的最大有效前缀，
+    # 而不是要求整段都是合法 JSON——否则一次调用就白烧了。
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content, re.I | re.S)
     if fenced:
         content = fenced.group(1)
-    parsed = json.loads(content)
+    parsed = _extract_json_prefix(content)
     if not isinstance(parsed, dict):
         raise RuntimeError("模型输出必须是 JSON 对象")
     return parsed
+
+
+def _extract_json_prefix(content: str) -> Any:
+    """从字符串里取以 { 开头的最长合法 JSON 前缀。
+
+    模型截断时最后一组括号往往根本没闭合，仅从已有的 } 往前截取会
+    一无所获。所以按两层恢复：
+
+    1. 从最后一个 } 开始向前找截断点，能解析的最长前缀即为答案；
+    2. 都不行时数出未闭合的括号层级，尝试补上缺失的收尾括号再解析。
+       （截断的最后一串字符若是半个字符串值，补括号也救不回来，
+       只能退到上一层截断点。）
+
+    修复后的输出可能比预期少最后一个字段，但好过整份报废。
+    """
+    start = content.find("{")
+    if start < 0:
+        raise RuntimeError("模型输出中没有 JSON 对象")
+    content = content[start:]
+
+    last_close = content.rfind("}")
+    while last_close >= 0:
+        candidate = content[: last_close + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            last_close = content.rfind("}", 0, last_close)
+
+    for closing in _closing_suffixes(content):
+        candidate = content + closing
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    # 截断恰好切在某个值中间时，补括号也救不回来；把尾部未完成的
+    # 字符逐步剥掉，再对剥掉后的前缀补括号。候选按"保留最多结构"排序：
+    # 先试直接补括号（可能带出一个空的末项），再逐字符回退。
+    for cut in range(1, min(80, len(content))):
+        prefix = content[:-cut]
+        for closing in _closing_suffixes(prefix):
+            candidate = prefix + closing
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    raise RuntimeError("无法从模型输出中恢复合法 JSON")
+
+
+def _closing_suffixes(content: str) -> list[str]:
+    """按未闭合括号栈推出候选收尾串（最完整优先）。
+
+    只补能被 json.loads 证实的组合：栈里倒数第 k 个未闭合括号
+    之前的所有字符都已完成时，补上后 k 个反括号即可解析。
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in content:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":  # 括号栈
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if stack:
+                stack.pop()
+    if not stack or len(stack) > 16:
+        return []
+    return ["".join(reversed(stack[:k])) for k in range(1, len(stack) + 1)]
 
 
 def _optional_int(value: Any) -> int | None:
@@ -124,4 +204,6 @@ def _json_max_tokens(system: str) -> int:
         return 200
     if "字段必须是 title" in system:
         return 1400
-    return 1800
+    # 专业 Agent 贡献对象要容纳 10 只股票的 claim/风险/未知项，
+    # 1800 上限会截断输出导致 JSON 报废。
+    return 4096

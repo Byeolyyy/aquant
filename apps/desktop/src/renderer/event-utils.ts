@@ -1,11 +1,16 @@
 import type { HarnessEvent } from "../shared/protocol";
 
 export const AGENT_NAMES: Record<string, string> = {
+  brain: "大脑 Agent",
   coordinator: "统筹 Agent",
   quant_signal: "量化信号 Agent",
   company_industry: "公司与行业 Agent",
   global_market: "外围市场 Agent",
   risk: "风险 Agent",
+  capital_trace: "资金追查 Agent",
+  bearish_analysis: "利空分析 Agent",
+  global_sector_flow: "外围板块资金 Agent",
+  sector_transmission: "板块传导映射 Agent",
   market_event: "市场事件 Agent（历史）",
   evidence_risk: "证据与风险 Agent（历史）",
 };
@@ -27,11 +32,16 @@ export function eventSummary(event: HarnessEvent): string {
     const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
     return `我已发布 ${tasks.length} 项并行分析，并安排后续风险复核与最终综合。下面是完整流程。`;
   }
+  if (event.kind === "task.event_dispatch") {
+    const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+    const titles = tasks.map((task) => task.title).join("、");
+    return `事件规则触发（${payload.rule_id ?? ""}），秘书已派发：${titles}`;
+  }
   return event.kind;
 }
 
 export function isMessageEvent(event: HarnessEvent): boolean {
-  return Boolean(event.agent_id) && (event.kind === "agent.message" || event.kind === "task.plan");
+  return Boolean(event.agent_id) && (event.kind === "agent.message" || event.kind === "task.plan" || event.kind === "task.event_dispatch");
 }
 
 function appendSection(sections: string[], title: string, value: unknown): void {

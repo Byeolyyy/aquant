@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fakes import FakeGlobalMarket
 from quant_agent_harness.harness import Harness
 from quant_agent_harness.models import AgentRuntimeConfig
 from quant_agent_harness.parser import parse_ptrade_report
@@ -38,7 +39,11 @@ class GovernanceObservabilityTests(unittest.TestCase):
             report = parse_ptrade_report(RAW)
             repository.save_report(report)
             events = []
-            harness = Harness(repository, events.append)
+            harness = Harness(
+                repository,
+                events.append,
+                global_market_client=FakeGlobalMarket(),  # type: ignore[arg-type]
+            )
             run_id = harness.start(report.report_id)
             harness.wait(run_id, timeout=5)
             plan = next(event for event in events if event.kind == "task.plan")
@@ -52,7 +57,11 @@ class GovernanceObservabilityTests(unittest.TestCase):
             report = parse_ptrade_report(RAW)
             repository.save_report(report)
             events = []
-            harness = Harness(repository, events.append)
+            harness = Harness(
+                repository,
+                events.append,
+                global_market_client=FakeGlobalMarket(),  # type: ignore[arg-type]
+            )
             run_id = harness.start(report.report_id)
             harness.wait(run_id, timeout=5)
             snapshot = repository.run_snapshot(run_id)

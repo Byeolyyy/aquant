@@ -28,6 +28,12 @@
     "directories": { "output": "release" },
     "win": { "target": ["dir"] }
   },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  },
   "devDependencies": {
     "@types/node": "latest",
     "@types/react": "latest",
@@ -36,7 +42,7 @@
     "cross-env": "latest",
     "electron": "43.1.1",
     "electron-builder": "^26.15.3",
-    "typescript": "latest",
+    "typescript": "^5.9.3",
     "vitest": "latest",
     "wait-on": "latest"
   }

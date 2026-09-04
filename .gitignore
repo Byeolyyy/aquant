@@ -20,3 +20,9 @@ release/
 build/
 apps/desktop/resources/harness/
 新建 文本文档.txt
+.lumina/
+# 上游 PTrade 发信侧脚本，含硬编码的邮箱与 SMTP 授权码，不得进入公开仓库。
+services/harness/examples/
+
+# 诊断调试残留
+.diag-*

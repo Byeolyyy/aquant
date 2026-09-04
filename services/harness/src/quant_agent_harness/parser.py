@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -17,6 +18,7 @@ NUMERIC_FIELDS = {
     "super_net_wanyuan",
     "large_net_wanyuan",
     "medium_net_wanyuan",
+    "small_net_wanyuan",
     "main_net_wanyuan",
     "realtime_formula_wanyuan",
     "realtime_formula_ratio_pct",
@@ -49,10 +51,59 @@ REQUIRED_FIELDS = {
 EMPTY_VALUES = {"", "-", "--", "none", "null", "nan", "n/a"}
 VALID_CODE_PREFIXES = ("0", "3", "4", "6", "8", "9")
 REASON_VALUES = {"all_conditions_met", "near_miss", "abnormal", "selected", "candidate"}
+# 资金门槛是策略固定参数：精简邮件不再随行下发，由解析器按常量注入（单位万元）。
+# 环境变量 PTRADE_FLOW_THRESHOLD_WANYUAN 可覆盖，例如上调门槛时无需改上游与消息格式。
+def _strategy_flow_threshold() -> Decimal:
+    raw = os.environ.get("PTRADE_FLOW_THRESHOLD_WANYUAN", "4000")
+    try:
+        return Decimal(str(raw).strip())
+    except InvalidOperation:
+        return Decimal("4000")
+
+
+# 市值分档门槛（与上游 PTrade 2026-08 版口径一致）：
+# - 1000 亿以上：资金公式 ≥ 流通市值 × 0.4%（无固定金额封顶，1000 亿处即 4 亿元）
+# - 1000 亿及以下：沿用原门槛（50 亿以上档实际生效值恒为 4000 万封顶）
+LARGE_CAP_BOUNDARY_YI = Decimal("1000")
+LARGE_CAP_FLOW_RATIO_PCT = Decimal("0.4")
+# 邮件占比只保留两位小数，反推市值在 1000 亿边界附近有约 2% 误差。
+# 落在这个窗口内时按左档（4000 万参考口径）处理：宁可"高出"偏乐观，
+# 也不把一只真实达标的票显示成"低于门槛"。
+CAP_ESTIMATE_AMBIGUITY_YI = Decimal("20")
+
+
+def tiered_flow_threshold_wanyuan(
+    realtime_formula_wanyuan: Decimal | None,
+    realtime_formula_ratio_pct: Decimal | None,
+) -> Decimal | None:
+    """按反推市值分档估算该标的的真实资金门槛（单位万元）。
+
+    邮件不携带市值，用「资金公式 ÷ 占比 × 100」反推流通市值（亿元）。
+    反推在 1000 亿边界 ±20 亿的模糊窗口内返回 None，由调用方回退到
+    4000 万参考口径；窗口之外：
+    - 市值 > 1000 亿 → 0.4% × 市值（每只票门槛不同）
+    - 市值 ≤ 1000 亿 → None（沿用注入常量，即原门槛口径）
+    """
+    if not realtime_formula_wanyuan or not realtime_formula_ratio_pct:
+        return None
+    if realtime_formula_wanyuan <= 0 or realtime_formula_ratio_pct <= 0:
+        return None
+    cap_yi = realtime_formula_wanyuan / (realtime_formula_ratio_pct * Decimal("100"))
+    if cap_yi <= LARGE_CAP_BOUNDARY_YI + CAP_ESTIMATE_AMBIGUITY_YI:
+        return None
+    # 门槛 = 市值(亿元) × 10000 × 0.4% = 市值 × 40（万元），取整到万元。
+    # 不取整的话 Decimal 除法会带长尾数，str() 会以科学计数法呈现。
+    return (cap_yi * Decimal("40")).quantize(Decimal("1"))
 # 邮件页脚（以及被截断后与页脚粘连的尾部残片）不能进入区段内容。
 # 页脚本身不是数据行；粘连行既可能缺列，也可能把 "14:16:46}" 这类
 # 页脚残片误对齐进 reason 等列，直接丢弃整行、保留前面的完整行。
 MAIL_FOOTER_RE = re.compile(r"邮件发送时间|sent_at", re.I)
+# PTrade 终端日志行的前缀，如 "2026-08-20 13:06:09 - INFO - "；
+# 用户直接复制运行日志粘贴时，区段标记和数据行会带上这类前缀，需先剥离。
+LOG_PREFIX_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\s*-\s*(?:INFO|WARNING|ERROR|DEBUG|CRITICAL)\s*-\s*",
+    re.I,
+)
 
 
 def parse_ptrade_report(raw_text: str) -> ParsedReport:
@@ -146,16 +197,33 @@ def _extract_metadata(raw_text: str) -> dict[str, str]:
 def _extract_sections(raw_text: str) -> tuple[dict[str, list[str]], list[str]]:
     lines = raw_text.splitlines()
     markers: list[tuple[int, str, str]] = []
-    pattern = re.compile(r"^\s*\{?\s*(selected_head|near_head)\s*[:：]\s*(.*?)\s*\}?\s*$", re.I)
+    # 回避池/abnormal 等区段已从精简消息中移除；若旧邮件仍有残留，
+    # 识别为区段边界并丢弃其内容，避免被误读为 near 数据行。
+    # 兼容两种来源：邮件正文（行首即标记）与 PTrade 终端日志（带时间戳前缀，
+    # 分隔符可能是 "="，如 "2026-08-20 13:06:09 - INFO - selected_head="）。
+    pattern = re.compile(
+        r"^\s*\{?\s*(selected_head|near_head|abnormal_head|avoid_head|回避池)\s*[:：=]\s*(.*?)\s*\}?\s*$",
+        re.I,
+    )
     for index, line in enumerate(lines):
-        match = pattern.match(line)
-        if match:
-            section = "selected" if match.group(1).lower().startswith("selected") else "near"
-            markers.append((index, section, match.group(2)))
+        stripped = LOG_PREFIX_RE.sub("", line)
+        match = pattern.match(stripped)
+        if not match:
+            continue
+        marker = match.group(1).lower()
+        if marker.startswith("selected"):
+            section = "selected"
+        elif marker.startswith("near"):
+            section = "near"
+        else:
+            section = "ignore"
+        markers.append((index, section, match.group(2)))
 
     sections: dict[str, list[str]] = {}
     errors: list[str] = []
     for marker_index, (line_index, section, inline) in enumerate(markers):
+        if section == "ignore":
+            continue
         if section in sections:
             errors.append(f"重复的 {section}_head 区段")
             continue
@@ -169,8 +237,12 @@ def _extract_sections(raw_text: str) -> tuple[dict[str, list[str]], list[str]]:
         content.extend(
             line.strip()
             for line in lines[line_index + 1 : next_index]
-            if line.strip() and not MAIL_FOOTER_RE.search(line)
+            if line.strip() and not MAIL_FOOTER_RE.search(line) and not LOG_PREFIX_RE.match(line)
         )
+        # 上游空池可能打印成区段名单独一行、下一行 "empty"；同样视为空池。
+        if len(content) == 1 and content[0].lower() in {"empty", "[]", "none"}:
+            sections[section] = []
+            continue
         sections[section] = content
     return sections, errors
 
@@ -220,6 +292,22 @@ def _parse_section(
         parsed["unknown_fields"] = {
             key: value for key, value in aligned.items() if key not in KNOWN_FIELDS and value not in EMPTY_VALUES
         }
+        # 精简格式不再下发 reason 与 flow_threshold_wanyuan 两列：
+        # 以 small_net_wanyuan 列作为精简格式标识，此时才按区段默认 reason、
+        # 注入资金门槛；旧格式缺列仍按缺失处理（fail closed）。
+        # 门槛按市值分档（2026-08 起）：1000 亿以上为流通市值×0.4%（逐票
+        # 不同，用 资金公式÷占比 反推市值计算）；其余沿用策略常量。
+        if "small_net_wanyuan" in headers:
+            if "reason" not in headers:
+                parsed["reason"] = "all_conditions_met" if source_pool == "selected" else "near_miss"
+            if "flow_threshold_wanyuan" not in headers:
+                parsed["flow_threshold_wanyuan"] = (
+                    tiered_flow_threshold_wanyuan(
+                        parsed.get("realtime_formula_wanyuan"),
+                        parsed.get("realtime_formula_ratio_pct"),
+                    )
+                    or _strategy_flow_threshold()
+                )
         parsed["missing_fields"] = sorted(
             field for field in REQUIRED_FIELDS if _missing_required(field, parsed.get(field))
         )

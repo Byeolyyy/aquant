@@ -5,6 +5,7 @@ import unittest
 import sqlite3
 from pathlib import Path
 
+from fakes import FakeGlobalMarket
 from quant_agent_harness.agent_prompts import PLATFORM_POLICY_PROMPT
 from quant_agent_harness.harness import Harness, _compact_report
 from quant_agent_harness.global_markets import GlobalMarketClient
@@ -200,7 +201,11 @@ class PromptWorkbenchAndSubgraphTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = Repository(Path(temp_dir) / "test.sqlite")
             events = []
-            harness = Harness(repository, events.append)
+            harness = Harness(
+                repository,
+                events.append,
+                global_market_client=FakeGlobalMarket(),  # type: ignore[arg-type]
+            )
             for minute in ("30", "31"):
                 report = parse_ptrade_report(RAW.replace("14:30:00", f"14:{minute}:00"))
                 repository.save_report(report)
@@ -231,7 +236,15 @@ class PromptWorkbenchAndSubgraphTests(unittest.TestCase):
             workflows = server.handle("get_workflows", {})["workflows"]
             self.assertEqual(
                 {workflow["workflow_id"] for workflow in workflows},
-                {"quant-signal-subgraph", "global-market-subgraph", "negative-news-risk-subgraph"},
+                {
+                    "quant-signal-subgraph",
+                    "global-market-subgraph",
+                    "negative-news-risk-subgraph",
+                    "capital-trace-subgraph",
+                    "bearish-analysis-subgraph",
+                    "global-sector-flow-subgraph",
+                    "sector-transmission-subgraph",
+                },
             )
 
 
